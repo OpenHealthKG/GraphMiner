@@ -4,7 +4,7 @@ import java.io.Serializable;
 import java.util.HashSet;
 
 /**
- * Denotes a heuristic that uses variations of P(X_1), P(X_0), P(Y_1), P(Y_0), and P(X_1^Y_1) to mine potential graph
+ * Denotes a heuristic that uses variations of P(X_1), P(Y_1), and P(X_1^Y_1) to mine potential graph
  * edges between nodes X and Y within an overall corpus
  */
 public abstract class PXYHeuristic implements Serializable {
