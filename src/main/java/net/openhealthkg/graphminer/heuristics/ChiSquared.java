@@ -9,7 +9,7 @@ public class ChiSquared extends PXYHeuristic{
     public double score() {
         double N = getCollSize();
 
-        // Get counts from probilities to construct the chi-squared table
+        // Get counts from probabilities to construct the chi-squared table
         double a = getPXandY() * N;          // X ^ Y
         double b = getPXandNegY() * N;       // X ^ !Y
         double c = getPNegXandY() * N;       // !X ^ Y

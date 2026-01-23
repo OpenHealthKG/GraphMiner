@@ -8,9 +8,9 @@ import java.util.HashSet;
  * edges between nodes X and Y within an overall corpus
  */
 public abstract class PXYHeuristic implements Serializable {
-    private HashSet<String> x_1 = new HashSet<>();
-    private HashSet<String> y_1 = new HashSet<>();
-    private long collSize;
+    protected HashSet<String> x_1 = new HashSet<>();
+    protected HashSet<String> y_1 = new HashSet<>();
+    protected long collSize;
 
     public PXYHeuristic(long collSize) {
         this.collSize = collSize;
