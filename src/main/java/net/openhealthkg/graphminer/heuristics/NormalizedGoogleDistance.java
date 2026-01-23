@@ -6,8 +6,7 @@ package net.openhealthkg.graphminer.heuristics;
  * Where:
  *   - f(x)   = number of documents containing x
  *   - f(x,y) = number of documents containing both x and y
- *   - N      = corpus size (total documents)*
- * A lower score indicates a greater degree of relatedness between x and y
+ *   - N      = corpus size (total documents)
  */
 public class NormalizedGoogleDistance extends PXYHeuristic {
 
@@ -15,6 +14,9 @@ public class NormalizedGoogleDistance extends PXYHeuristic {
         super(collSize);
     }
 
+    /**
+     * @return 1/(1+NGD), so as to re-scale to higher scores denoting greater similarity
+     */
     @Override
     public double score() {
         final double N = getCollSize();
@@ -43,6 +45,6 @@ public class NormalizedGoogleDistance extends PXYHeuristic {
         if (denom <= 0.0) return Double.MAX_VALUE; // If term occurs in all documents (unlikely)
 
         final double ngd = (maxLog - logFxy) / denom;
-        return Math.max(0.0, ngd);
+        return 1/(1 + Math.max(0.0, ngd)); // Re-scale so higher is better
     }
 }
