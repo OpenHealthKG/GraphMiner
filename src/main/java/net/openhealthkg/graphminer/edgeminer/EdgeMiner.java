@@ -7,7 +7,7 @@ import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.types.DataTypes;
 
-public abstract class EdgeMiner {
+public class EdgeMiner {
 
     private final PXYHeuristic[] heuristics;
 
@@ -21,7 +21,7 @@ public abstract class EdgeMiner {
      * @param cohortSize cohort size, if known. Otherwise 0 to infer from occurrence_ids
      * @return
      */
-    private Dataset<Row> scoreTermPairs(Dataset<Row> df, long cohortSize) {
+    public Dataset<Row> scoreTermPairs(Dataset<Row> df, long cohortSize) {
         df = df.select("node_id", "occurrence_id").distinct();
         if (cohortSize == 0) cohortSize = df.select("occurrence_id").distinct().count();
         Dataset<Row> nodeFreqs = df.groupBy("node_id").count();
