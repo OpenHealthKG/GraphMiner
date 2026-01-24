@@ -5,6 +5,7 @@ import static org.apache.spark.sql.functions.*;
 import net.openhealthkg.graphminer.heuristics.PXYHeuristic;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
+import org.apache.spark.sql.types.DataTypes;
 
 public abstract class EdgeMiner {
 
@@ -69,8 +70,8 @@ public abstract class EdgeMiner {
 
         // Now calculate heuristics
         for (PXYHeuristic heuristic : heuristics) {
-
+            ret = ret.withColumn(heuristic.getHeuristicName(), udf(heuristic, DataTypes.DoubleType).apply(ret.col("fx"), ret.col("fy"), ret.col("fxy"), ret.col("cohort_size")));
         }
-        return df;
+        return ret;
     }
 }

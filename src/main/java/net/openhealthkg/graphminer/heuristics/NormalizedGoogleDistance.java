@@ -8,25 +8,17 @@ package net.openhealthkg.graphminer.heuristics;
  *   - f(x,y) = number of documents containing both x and y
  *   - N      = corpus size (total documents)
  */
-public class NormalizedGoogleDistance extends PXYHeuristic {
+public class NormalizedGoogleDistance implements PXYHeuristic {
 
-    public NormalizedGoogleDistance(long collSize) {
-        super(collSize);
+    @Override
+    public String getHeuristicName() {
+        return "ngd";
     }
 
-    /**
-     * @return 1/(1+NGD), so as to re-scale to higher scores denoting greater similarity
-     */
     @Override
-    public double score() {
-        final double N = getCollSize();
-
-        final double fx  = this.x_1.size();
-        final double fy  = this.y_1.size();
-        final double fxy = Math.max(0.0, Math.rint(getPXandY() * N));
-
+    public Double call(Long fx, Long fy, Long fxy, Long coll_size) throws Exception {
         // Guardrails
-        if (N <= 1.0) return Double.MAX_VALUE;           // log(N) invalid / degenerate corpus
+        if (coll_size <= 1.0) return Double.MAX_VALUE;           // log(N) invalid / degenerate corpus
         if (fx <= 0.0 || fy <= 0.0) return Double.MAX_VALUE; // one term never appears (should never happen with our use case)
         if (fxy <= 0.0) return Double.MAX_VALUE;         // never co-occurs
 
@@ -36,7 +28,7 @@ public class NormalizedGoogleDistance extends PXYHeuristic {
         final double logFx  = Math.log(fx);
         final double logFy  = Math.log(fy);
         final double logFxy = Math.log(fxyClamped);
-        final double logN   = Math.log(N);
+        final double logN   = Math.log(coll_size);
 
         final double maxLog = Math.max(logFx, logFy);
         final double minLog = Math.min(logFx, logFy);

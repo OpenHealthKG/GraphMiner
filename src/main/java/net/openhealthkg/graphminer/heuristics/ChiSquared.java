@@ -1,19 +1,21 @@
 package net.openhealthkg.graphminer.heuristics;
 
-public class ChiSquared extends PXYHeuristic{
-    public ChiSquared(long collSize) {
-        super(collSize);
+public class ChiSquared implements PXYHeuristic {
+
+    @Override
+    public String getHeuristicName() {
+        return "chi_squared";
     }
 
     @Override
-    public double score() {
-        double N = getCollSize();
+    public Double call(Long fx, Long fy, Long fxy, Long coll_size) throws Exception {
+        double N = coll_size;
 
         // Get counts from probabilities to construct the chi-squared table
-        double a = getPXandY() * N;          // X ^ Y
-        double b = getPXandNegY() * N;       // X ^ !Y
-        double c = getPNegXandY() * N;       // !X ^ Y
-        double d = getPNegXandNegY() * N;    // !X ^ !Y
+        double a = fxy;                         // X ^ Y
+        double b = fx-fxy;                      // X ^ !Y
+        double c = fy-fxy;                      // !X ^ Y
+        double d = coll_size - a - b - c;       // !X ^ !Y
 
         // Row/Column Edges to calculate Expected Counts (Row Total * Column Total/N)
         double rowX = a + b;
@@ -34,7 +36,6 @@ public class ChiSquared extends PXYHeuristic{
         if (eb > 0) chi2 += Math.pow(b - eb, 2) / eb;
         if (ec > 0) chi2 += Math.pow(c - ec, 2) / ec;
         if (ed > 0) chi2 += Math.pow(d - ed, 2) / ed;
-
         return chi2;
     }
 }
