@@ -4,6 +4,7 @@ import static org.apache.spark.sql.functions.*;
 
 import net.openhealthkg.graphminer.edgeminer.EdgeMiner;
 import net.openhealthkg.graphminer.heuristics.ChiSquared;
+import net.openhealthkg.graphminer.heuristics.JLH;
 import net.openhealthkg.graphminer.heuristics.MutualInformation;
 import net.openhealthkg.graphminer.heuristics.NormalizedGoogleDistance;
 import org.apache.spark.SparkConf;
@@ -22,7 +23,7 @@ public class FromOMOP {
                 .distinct()
                 .count();
 
-        EdgeMiner miner = new EdgeMiner(new ChiSquared(), new MutualInformation(), new NormalizedGoogleDistance());
+        EdgeMiner miner = new EdgeMiner(new ChiSquared(), new MutualInformation(), new NormalizedGoogleDistance(), new JLH());
         // condition_occurrence: (person_id, condition_concept_id)
         Dataset<Row> cond = spark.table("condition_occurrence")
                 .select(
