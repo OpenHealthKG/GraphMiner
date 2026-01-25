@@ -3,9 +3,13 @@ package net.openhealthkg.graphminer.edgeminer;
 import static org.apache.spark.sql.functions.*;
 
 import net.openhealthkg.graphminer.heuristics.PXYHeuristic;
+import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.types.DataTypes;
+
+import java.util.ArrayList;
+import java.util.List;
 
 public class EdgeMiner {
 
@@ -70,8 +74,42 @@ public class EdgeMiner {
 
         // Now calculate heuristics
         for (PXYHeuristic heuristic : heuristics) {
-            ret = ret.withColumn(heuristic.getHeuristicName(), udf(heuristic, DataTypes.DoubleType).apply(ret.col("fx"), ret.col("fy"), ret.col("fxy"), ret.col("cohort_size")));
+            ret = ret.withColumn(heuristic.getHeuristicName() + "_raw", udf(heuristic, DataTypes.DoubleType).apply(ret.col("fx"), ret.col("fy"), ret.col("fxy"), ret.col("cohort_size")));
         }
-        return ret;
+        // Now we need to re-scale to 0->1 w/ outlier handling. To do this, we do log scale divided by max log.
+        for (PXYHeuristic heuristic : heuristics) {
+            String rawCol = heuristic.getHeuristicName() + "_raw";
+            String scaledCol = heuristic.getHeuristicName();
+
+            Double maxLog = ret
+                    .select(max(log1p(col(rawCol))).alias("max_log"))
+                    .first()
+                    .getDouble(0);
+
+            if (maxLog == 0.0) {
+                ret = ret.withColumn(scaledCol, lit(0.0));
+                continue;
+            }
+            ret = ret.withColumn(
+                    scaledCol,
+                    when(col(rawCol).equalTo(0), lit(0.0))
+                            .otherwise(log1p(col(rawCol)).divide(lit(maxLog)))
+            );
+        }
+        List<Column> finalCols = new ArrayList<>();
+
+        finalCols.add(col("x_node_id"));
+        finalCols.add(col("y_node_id"));
+        finalCols.add(col("fx"));
+        finalCols.add(col("fy"));
+        finalCols.add(col("fxy"));
+        finalCols.add(col("cohort_size"));
+
+        for (PXYHeuristic heuristic : heuristics) {
+            String name = heuristic.getHeuristicName();
+            finalCols.add(col(name));
+        }
+
+        return ret.select(finalCols.toArray(new Column[0]));
     }
 }
