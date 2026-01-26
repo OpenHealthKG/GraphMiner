@@ -56,9 +56,9 @@ public class FromOMOP {
         Dataset<Row> node_id_mapping = node_ids_compressed._2;
         node_id_mapping.coalesce(1).write().format("csv").save("node_id_mappings");
         node_id_mapping.unpersist();
+        nodeOccurrences = Util.mapIDstoNumeric(nodeOccurrences, "occurrence_id")._1;
         // Now actually get edge scores
         Dataset<Row> df = miner.scoreTermPairs(nodeOccurrences, cohortSize);
-
         // Write
         df.write().saveAsTable("openhealthkg.edges");
 
