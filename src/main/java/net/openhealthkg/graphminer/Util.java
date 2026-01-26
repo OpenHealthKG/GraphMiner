@@ -20,7 +20,7 @@ public class Util {
      */
     public static Tuple2<Dataset<Row> , Dataset<Row>> mapIDstoNumeric(Dataset<Row> input, String column) {
         String[] columns = input.columns();
-        Dataset<Row> mappingDF = input.select(column).distinct().withColumnRenamed(column, "src_" + column).withColumn("tgt_" + column, functions.row_number().over(Window.orderBy(functions.rand()))).persist(StorageLevel.DISK_ONLY()); // Persist the mapping DF for consistency
+        Dataset<Row> mappingDF = input.select(column).distinct().withColumnRenamed(column, "src_" + column).withColumn("tgt_" + column, functions.row_number().over(Window.orderBy(functions.rand(123)))).persist(StorageLevel.DISK_ONLY()); // Persist the mapping DF for consistency
         Dataset<Row> outputDF = input.join(
                 mappingDF, input.col(column).equalTo(mappingDF.col("tgt_" + column))
         ).select(
