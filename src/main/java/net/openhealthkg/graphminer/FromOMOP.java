@@ -11,6 +11,7 @@ import org.apache.spark.SparkConf;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import scala.Tuple2;
 
 /**
  *
@@ -50,7 +51,11 @@ public class FromOMOP {
 
         // Union into node_id, occurrence_id format
         Dataset<Row> nodeOccurrences = cond.unionByName(drug).unionByName(proc).distinct();
-
+        Tuple2<Dataset<Row>, Dataset<Row>> node_ids_compressed = Util.mapIDstoNumeric(nodeOccurrences, "node_id");
+        nodeOccurrences = node_ids_compressed._1;
+        Dataset<Row> node_id_mapping = node_ids_compressed._2;
+        node_id_mapping.coalesce(1).write().format("csv").save("node_id_mappings");
+        node_id_mapping.unpersist();
         // Now actually get edge scores
         Dataset<Row> df = miner.scoreTermPairs(nodeOccurrences, cohortSize);
 
