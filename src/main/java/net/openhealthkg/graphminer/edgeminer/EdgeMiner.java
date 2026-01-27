@@ -47,7 +47,6 @@ public class EdgeMiner {
         Dataset<Row> ox = df.withColumnRenamed("node_id", "x_node_id");
         Dataset<Row> oy = df.withColumnRenamed("node_id", "y_node_id");
         Dataset<Row> dfxy = ox.join(oy, ox.col("occurrence_id").equalTo(oy.col("occurrence_id")))
-                .where(ox.col("x_node_id").lt(oy.col("y_node_id"))) //  prevent (x,y) and (y,x) both showing up
                 .select("x_node_id", "y_node_id")
                 .groupBy("x_node_id", "y_node_id")
                 .agg(count(lit(1)).as("fxy"));
