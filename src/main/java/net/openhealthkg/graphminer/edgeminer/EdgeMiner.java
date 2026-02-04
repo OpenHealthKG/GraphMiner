@@ -4,18 +4,21 @@ import static org.apache.spark.sql.functions.*;
 
 import net.openhealthkg.graphminer.Util;
 import net.openhealthkg.graphminer.heuristics.PXYHeuristic;
-import org.apache.spark.sql.Column;
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
+import org.apache.spark.Aggregator;
+import org.apache.spark.ml.linalg.SparseVector;
+import org.apache.spark.mllib.linalg.VectorUDT;
+import org.apache.spark.sql.*;
+import org.apache.spark.sql.catalyst.encoders.RowEncoder;
 import org.apache.spark.sql.expressions.Window;
-import org.apache.spark.sql.functions;
 import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.Metadata;
+import org.apache.spark.sql.types.StructField;
+import org.apache.spark.sql.types.StructType;
 import org.apache.spark.storage.StorageLevel;
 import scala.Tuple2;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 public class EdgeMiner {
@@ -28,6 +31,7 @@ public class EdgeMiner {
         Tuple2<Dataset<Row>, Dataset<Row>> mapped = Util.mapIDstoNumeric(df, "node_id");
         df = mapped._1;
         Dataset<Row> mappings = mapped._2.persist();
+        long numNodes = mappings.count();
         df = Util.mapIDstoNumeric(df, "occurrence_id")._1; // We don't need to retain the original occurrence_id
         // Perform the actual scoring.
         Dataset<Row> scoreTermPairs = scoreTermPairs(df, cohortSize, heuristics);
@@ -36,14 +40,9 @@ public class EdgeMiner {
             scoreTermPairs = keepTopN(scoreTermPairs, keepTopN);
         }
         scoreTermPairs.persist(StorageLevel.DISK_ONLY()); // Persist this (very large) dataset to disk now that we are not doing any further ops TODO
+        Dataset<Row> heuristicFeatureVectors = vectorizeHeuristics(scoreTermPairs, numNodes, heuristics);
 
 
-    }
-
-    public Dataset<Row> keepTopN(Dataset<Row> df, int n, PXYHeuristic... heuristics) {
-        return df.withColumn("min_rank", functions.least(
-                Arrays.stream(heuristics).map(h -> functions.row_number().over(Window.partitionBy("x_node_id").orderBy(functions.col(h.getHeuristicName()).desc_nulls_last()))).toArray(Column[]::new))
-        ).filter(functions.col("min_rank").isNotNull().and(functions.col("min_rank").leq(functions.lit(n)))).drop("min_rank");
     }
 
     /**
@@ -134,10 +133,40 @@ public class EdgeMiner {
         return ret.select(finalCols.toArray(new Column[0]));
     }
 
-    public Dataset<Row> vectorizeHeuristics(Dataset<Row> df, PXYHeuristic... heuristics) {
-        final String[] heuristicCols = Arrays.stream(heuristics)
-                .map(PXYHeuristic::getHeuristicName)
-                .toArray(String[]::new);
-
+    public Dataset<Row> keepTopN(Dataset<Row> df, int n, PXYHeuristic... heuristics) {
+        return df.withColumn("min_rank", functions.least(
+                Arrays.stream(heuristics).map(h -> functions.row_number().over(Window.partitionBy("x_node_id").orderBy(functions.col(h.getHeuristicName()).desc_nulls_last()))).toArray(Column[]::new))
+        ).filter(functions.col("min_rank").isNotNull().and(functions.col("min_rank").leq(functions.lit(n)))).drop("min_rank");
     }
+
+    public Dataset<Row> vectorizeHeuristics(Dataset<Row> df, long numNodes, PXYHeuristic... heuristics) {
+        return df.repartition(functions.col("x_node_id")).mapPartitions(
+                (Iterator<Row> it) -> {
+                    List<Integer> indices = new ArrayList<>();
+                    List<Double> values = new ArrayList<>();
+                    AtomicInteger x_node_id = new AtomicInteger(-1);
+                    it.forEachRemaining(r -> {
+                        if (x_node_id.get() == -1) {
+                            x_node_id.set(Math.toIntExact(r.getLong(r.fieldIndex("x_node_id"))));
+                        }
+                        Integer offset = Math.toIntExact((r.getLong(r.fieldIndex("y_node_id")) - 1) * heuristics.length); // ID remapping uses row_number() which is 1-indexed
+                        int i = 0;
+                        for (PXYHeuristic heuristic : heuristics) {
+                            indices.add(offset + i);
+                            values.add(r.getDouble(r.fieldIndex(heuristic.getHeuristicName())));
+                            i++;
+                        }
+                    });
+                    return Collections.singleton(RowFactory.create(x_node_id, new SparseVector(Math.toIntExact(numNodes * heuristics.length), indices.stream().mapToInt(Integer::intValue).toArray(), values.stream().mapToDouble(Double::doubleValue).toArray()))).iterator();
+                },
+                RowEncoder.encoderFor(
+                        new StructType(
+                                new StructField[]{
+                                        StructField.apply("x_node_id", DataTypes.LongType, false, Metadata.empty()),
+                                        StructField.apply("heurisitics_vector", new VectorUDT(), false, Metadata.empty())
+                                }
+                        )
+                )
+        );
+    };
 }
