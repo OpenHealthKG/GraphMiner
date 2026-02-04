@@ -2,32 +2,58 @@ package net.openhealthkg.graphminer.edgeminer;
 
 import static org.apache.spark.sql.functions.*;
 
+import net.openhealthkg.graphminer.Util;
 import net.openhealthkg.graphminer.heuristics.PXYHeuristic;
 import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
+import org.apache.spark.sql.expressions.Window;
+import org.apache.spark.sql.functions;
 import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.storage.StorageLevel;
+import scala.Tuple2;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.stream.Collectors;
 
 public class EdgeMiner {
 
-    private final PXYHeuristic[] heuristics;
 
-    public EdgeMiner(PXYHeuristic... heuristics) {
-        this.heuristics = heuristics;
+    public Dataset<Row> mineEdges(Dataset<Row> df, long cohortSize, int keepTopN, PXYHeuristic... heuristics) {
+        cohortSize = cohortSize == 0 ? df.select("occurrence_id").distinct().count() : cohortSize;
+        // Map to integer IDs for space and retain the mappings
+        df = df.select("node_id", "occurrence_id").distinct();
+        Tuple2<Dataset<Row>, Dataset<Row>> mapped = Util.mapIDstoNumeric(df, "node_id");
+        df = mapped._1;
+        Dataset<Row> mappings = mapped._2.persist();
+        df = Util.mapIDstoNumeric(df, "occurrence_id")._1; // We don't need to retain the original occurrence_id
+        // Perform the actual scoring.
+        Dataset<Row> scoreTermPairs = scoreTermPairs(df, cohortSize, heuristics);
+        // Filter top N scores
+        if (keepTopN > 0) {
+            scoreTermPairs = keepTopN(scoreTermPairs, keepTopN);
+        }
+        scoreTermPairs.persist(StorageLevel.DISK_ONLY()); // Persist this (very large) dataset to disk now that we are not doing any further ops TODO
+
+
+    }
+
+    public Dataset<Row> keepTopN(Dataset<Row> df, int n, PXYHeuristic... heuristics) {
+        return df.withColumn("min_rank", functions.least(
+                Arrays.stream(heuristics).map(h -> functions.row_number().over(Window.partitionBy("x_node_id").orderBy(functions.col(h.getHeuristicName()).desc_nulls_last()))).toArray(Column[]::new))
+        ).filter(functions.col("min_rank").isNotNull().and(functions.col("min_rank").leq(functions.lit(n)))).drop("min_rank");
     }
 
     /**
      * @param df An input data frame consisting of (at a minimum) a string term/node identifier (located in the
      *           node_id column) and a string occurrence (document/patient) identifier.
-     * @param cohortSize cohort size, if known. Otherwise 0 to infer from occurrence_ids
-     * @return
+     * @param cohortSize cohort size
+     * @param heuristics the Heuristics to use
+     * @return A dataframe consisting of x_node_id, y_node_id, and each heuristic
      */
-    public Dataset<Row> scoreTermPairs(Dataset<Row> df, long cohortSize) {
-        df = df.select("node_id", "occurrence_id").distinct();
-        if (cohortSize == 0) cohortSize = df.select("occurrence_id").distinct().count();
+    public Dataset<Row> scoreTermPairs(Dataset<Row> df, long cohortSize, PXYHeuristic... heuristics) {
         Dataset<Row> nodeFreqs = df.groupBy("node_id").count();
 
         // Do a cartesian product to get all (x,y) combinations possible against which we build our frequency lists
@@ -99,10 +125,6 @@ public class EdgeMiner {
 
         finalCols.add(col("x_node_id"));
         finalCols.add(col("y_node_id"));
-        finalCols.add(col("fx"));
-        finalCols.add(col("fy"));
-        finalCols.add(col("fxy"));
-        finalCols.add(col("cohort_size"));
 
         for (PXYHeuristic heuristic : heuristics) {
             String name = heuristic.getHeuristicName();
@@ -110,5 +132,12 @@ public class EdgeMiner {
         }
 
         return ret.select(finalCols.toArray(new Column[0]));
+    }
+
+    public Dataset<Row> vectorizeHeuristics(Dataset<Row> df, PXYHeuristic... heuristics) {
+        final String[] heuristicCols = Arrays.stream(heuristics)
+                .map(PXYHeuristic::getHeuristicName)
+                .toArray(String[]::new);
+
     }
 }
