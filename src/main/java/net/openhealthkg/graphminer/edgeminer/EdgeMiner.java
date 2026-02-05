@@ -5,8 +5,13 @@ import static org.apache.spark.sql.functions.*;
 import net.openhealthkg.graphminer.Util;
 import net.openhealthkg.graphminer.heuristics.PXYHeuristic;
 import org.apache.spark.Aggregator;
+import org.apache.spark.ml.Pipeline;
+import org.apache.spark.ml.PipelineStage;
+import org.apache.spark.ml.feature.PCA;
+import org.apache.spark.ml.feature.StandardScaler;
+import org.apache.spark.ml.feature.VectorAssembler;
 import org.apache.spark.ml.linalg.SparseVector;
-import org.apache.spark.mllib.linalg.VectorUDT;
+import org.apache.spark.ml.linalg.VectorUDT;
 import org.apache.spark.sql.*;
 import org.apache.spark.sql.catalyst.encoders.RowEncoder;
 import org.apache.spark.sql.expressions.Window;
@@ -40,8 +45,8 @@ public class EdgeMiner {
             scoreTermPairs = keepTopN(scoreTermPairs, keepTopN);
         }
         scoreTermPairs.persist(StorageLevel.DISK_ONLY()); // Persist this (very large) dataset to disk now that we are not doing any further ops TODO
+        Dataset<Row> pcaSimScoring = applyPCAonHeuristics(df, heuristics);
         Dataset<Row> heuristicFeatureVectors = vectorizeHeuristics(scoreTermPairs, numNodes, heuristics);
-
 
     }
 
@@ -139,6 +144,46 @@ public class EdgeMiner {
         ).filter(functions.col("min_rank").isNotNull().and(functions.col("min_rank").leq(functions.lit(n)))).drop("min_rank");
     }
 
+
+    /**
+     * Calculates PC1 score for an x/y pair for the purposes of learning a generic sim_score
+     * @param df
+     * @param heuristics
+     * @return
+     */
+    public Dataset<Row> applyPCAonHeuristics(Dataset<Row> df, PXYHeuristic... heuristics) {
+        // logit scale heuristics
+        final double eps = 1e-6;
+        List<Column> projected = new ArrayList<>();
+        projected.add(col("x_node_id"));
+        projected.add(col("y_node_id"));
+        for (PXYHeuristic heuristic : heuristics) {
+            Column clipped = greatest(least(col(heuristic.getHeuristicName()), lit(1.0-eps)), lit(eps));
+            Column logit = log(clipped.divide(lit(1.0).minus(clipped))).alias(heuristic.getHeuristicName() + "_logit");
+            projected.add(logit);
+        }
+        df = df.select(projected.toArray(Column[]::new));
+        // Setup PCA
+        String[] pcaCols = Arrays.stream(heuristics).map(heuristic -> heuristic.getHeuristicName() + "_logit").toArray(String[]::new);
+        VectorAssembler assembler = new VectorAssembler()
+                .setInputCols(pcaCols)
+                .setOutputCol("heuristics_vec");
+        StandardScaler scaler = new StandardScaler()
+                .setInputCol("heuristics_vec")
+                .setOutputCol("heuristics_scaled")
+                .setWithMean(true)
+                .setWithStd(true);
+        PCA pca = new PCA()
+                .setInputCol("heuristics_scaled")
+                .setOutputCol("pca_vec")
+                .setK(1);
+        // Actually run the PCA
+        df = new Pipeline().setStages(new PipelineStage[] {assembler, scaler, pca}).fit(df).transform(df);
+        df = df.withColumn("sim_score", element_at(callUDF("vector_to_array", col("pca_vec")), 1));
+        return df.select("x_node_id", "y_node_id", "sim_score");
+
+    }
+
     public Dataset<Row> vectorizeHeuristics(Dataset<Row> df, long numNodes, PXYHeuristic... heuristics) {
         return df.repartition(functions.col("x_node_id")).mapPartitions(
                 (Iterator<Row> it) -> {
@@ -168,5 +213,5 @@ public class EdgeMiner {
                         )
                 )
         );
-    };
+    }
 }
