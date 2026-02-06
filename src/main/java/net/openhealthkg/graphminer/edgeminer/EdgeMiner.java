@@ -2,6 +2,10 @@ package net.openhealthkg.graphminer.edgeminer;
 
 import static org.apache.spark.sql.functions.*;
 
+import com.azure.ai.openai.OpenAIClient;
+import com.azure.ai.openai.OpenAIClientBuilder;
+import com.azure.ai.openai.models.*;
+import com.azure.core.credential.AzureKeyCredential;
 import net.openhealthkg.graphminer.Util;
 import net.openhealthkg.graphminer.heuristics.PXYHeuristic;
 import org.apache.hadoop.shaded.org.checkerframework.checker.units.qual.C;
@@ -14,6 +18,7 @@ import org.apache.spark.ml.feature.StandardScaler;
 import org.apache.spark.ml.feature.VectorAssembler;
 import org.apache.spark.ml.linalg.SparseVector;
 import org.apache.spark.ml.linalg.VectorUDT;
+import org.apache.spark.ml.linalg.Vectors;
 import org.apache.spark.sql.*;
 import org.apache.spark.sql.catalyst.encoders.RowEncoder;
 import org.apache.spark.sql.expressions.Window;
@@ -24,6 +29,11 @@ import org.apache.spark.sql.types.StructType;
 import org.apache.spark.storage.StorageLevel;
 import scala.Tuple2;
 
+import com.azure.ai.openai.OpenAIClient;
+import com.azure.ai.openai.OpenAIClientBuilder;
+import com.azure.ai.openai.models.Embeddings;
+import com.azure.ai.openai.models.EmbeddingsOptions;
+import com.azure.core.credential.AzureKeyCredential;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
@@ -57,15 +67,54 @@ public class EdgeMiner {
     }
 
     private Dataset<Row> getTextEmbeddingsForDescription(Dataset<Row> df) {
-        df.mapPartitions(
-                (MapPartitionsFunction<Row, Row>) it -> {
-                    List<Row> batch = new ArrayList<>();
-                    it.forEachRemaining(r -> {
+        int batch_size = 1024;
+        StructType schema = new StructType()
+                .add("node_id", DataTypes.StringType, false)
+                .add("node_embeddings", new VectorUDT(), false);
 
-                    })
-                }, RowEncoder.encoderFor(new StructType())
+        return df.mapPartitions(
+                (MapPartitionsFunction<Row, Row>) it -> {
+                    List<String> node_ids = new ArrayList<>();
+                    List<String> batch = new ArrayList<>();
+                    List<Row> results = new ArrayList<>();
+
+                    while (it.hasNext()) {
+                        Row r = it.next();
+                        if (batch.size() >= batch_size) {
+                            // Process batch
+                            processEmbeddingBatch(node_ids, batch, results);
+                            node_ids.clear();
+                            batch.clear();
+                        }
+                        node_ids.add(r.getString(r.fieldIndex("node_id")));
+                        batch.add(r.getString(r.fieldIndex("node_description")));
+                    }
+
+                    // Process remaining items
+                    if (!batch.isEmpty()) {
+                        processEmbeddingBatch(node_ids, batch, results);
+                    }
+
+                    return results.iterator();
+                }, RowEncoder.encoderFor(schema)
         );
-        return null;
+    }
+
+    private void processEmbeddingBatch(List<String> node_ids, List<String> texts, List<Row> results) {
+        OpenAIClient client = new OpenAIClientBuilder()
+                .credential(new AzureKeyCredential(System.getenv("AZURE_OPENAI_KEY")))
+                .endpoint(System.getenv("AZURE_OPENAI_ENDPOINT"))
+                .buildClient();
+
+            EmbeddingsOptions options = new EmbeddingsOptions(texts);
+            Embeddings embeddings = client.getEmbeddings("text-embedding-3-large", options);
+            int i = 0;
+            for (EmbeddingItem item : embeddings.getData()) {
+                String node_id = node_ids.get(i);
+                double[] vector = item.getEmbedding().stream().mapToDouble(Float::doubleValue).toArray();
+                results.add(RowFactory.create(node_id, Vectors.dense(vector)));
+            }
+        }
     }
 
     /**

@@ -35,5 +35,11 @@
             <version>3.5.0</version>
             <scope>provided</scope>
         </dependency>
+        <!-- OpenAI API -->
+        <dependency>
+            <groupId>com.azure</groupId>
+            <artifactId>azure-ai-openai</artifactId>
+            <version>1.0.0-beta.16</version>
+        </dependency>
     </dependencies>
 </project>
