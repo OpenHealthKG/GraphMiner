@@ -39,8 +39,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 public class EdgeMiner {
-
-
     public Dataset<Row> mineEdges(Dataset<Row> df, long cohortSize, int keepTopN, PXYHeuristic... heuristics) {
         cohortSize = cohortSize == 0 ? df.select("occurrence_id").distinct().count() : cohortSize;
         // Get a dataset of node IDs and names for the purposes of node description embeddings
@@ -67,7 +65,6 @@ public class EdgeMiner {
     }
 
     private Dataset<Row> getTextEmbeddingsForDescription(Dataset<Row> df) {
-        int batch_size = 1024;
         StructType schema = new StructType()
                 .add("node_id", DataTypes.StringType, false)
                 .add("node_embeddings", new VectorUDT(), false);
@@ -128,17 +125,17 @@ public class EdgeMiner {
                 .endpoint(System.getenv("AZURE_OPENAI_ENDPOINT"))
                 .buildClient();
 
-            EmbeddingsOptions options = new EmbeddingsOptions(texts);
-            Embeddings embeddings = client.getEmbeddings("text-embedding-3-large", options);
-            int i = 0;
-            for (EmbeddingItem item : embeddings.getData()) {
-                String node_id = node_ids.get(i);
-                double[] vector = item.getEmbedding().stream().mapToDouble(Float::doubleValue).toArray();
-                results.add(RowFactory.create(node_id, Vectors.dense(vector)));
-                i++;
-            }
+        EmbeddingsOptions options = new EmbeddingsOptions(texts);
+        Embeddings embeddings = client.getEmbeddings("text-embedding-3-large", options);
+        int i = 0;
+        for (EmbeddingItem item : embeddings.getData()) {
+            String node_id = node_ids.get(i);
+            double[] vector = item.getEmbedding().stream().mapToDouble(Float::doubleValue).toArray();
+            results.add(RowFactory.create(node_id, Vectors.dense(vector)));
+            i++;
         }
     }
+
 
     /**
      * @param df An input data frame consisting of (at a minimum) a string term/node identifier (located in the
