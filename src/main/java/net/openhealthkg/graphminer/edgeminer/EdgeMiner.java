@@ -73,30 +73,52 @@ public class EdgeMiner {
                 .add("node_embeddings", new VectorUDT(), false);
 
         return df.mapPartitions(
-                (MapPartitionsFunction<Row, Row>) it -> {
-                    List<String> node_ids = new ArrayList<>();
-                    List<String> batch = new ArrayList<>();
-                    List<Row> results = new ArrayList<>();
+                (MapPartitionsFunction<Row, Row>) it -> new Iterator<Row>() {
 
-                    while (it.hasNext()) {
-                        Row r = it.next();
-                        if (batch.size() >= batch_size) {
-                            // Process batch
-                            processEmbeddingBatch(node_ids, batch, results);
-                            node_ids.clear();
-                            batch.clear();
+                    private static final int BATCH_SIZE = 1024;
+
+                    private final List<Row> outputBuffer = new ArrayList<>();
+                    private boolean finished = false;
+
+                    @Override
+                    public boolean hasNext() {
+                        if (!outputBuffer.isEmpty()) {
+                            return true;
                         }
-                        node_ids.add(r.getString(r.fieldIndex("node_id")));
-                        batch.add(r.getString(r.fieldIndex("node_description")));
+                        if (finished) {
+                            return false;
+                        }
+                        loadNextBatch();
+                        return !outputBuffer.isEmpty();
                     }
 
-                    // Process remaining items
-                    if (!batch.isEmpty()) {
-                        processEmbeddingBatch(node_ids, batch, results);
+                    @Override
+                    public Row next() {
+                        if (!hasNext()) {
+                            throw new NoSuchElementException();
+                        }
+                        return outputBuffer.remove(0);
                     }
 
-                    return results.iterator();
-                }, RowEncoder.encoderFor(schema)
+                    private void loadNextBatch() {
+                        List<String> nodeIds = new ArrayList<>(BATCH_SIZE);
+                        List<String> texts = new ArrayList<>(BATCH_SIZE);
+
+                        while (it.hasNext() && nodeIds.size() < BATCH_SIZE) {
+                            Row r = it.next();
+                            nodeIds.add(r.getString(r.fieldIndex("node_id")));
+                            texts.add(r.getString(r.fieldIndex("node_description")));
+                        }
+
+                        if (nodeIds.isEmpty()) {
+                            finished = true;
+                            return;
+                        }
+
+                        processEmbeddingBatch(nodeIds, texts, outputBuffer);
+                    }
+                },
+                RowEncoder.encoderFor(schema)
         );
     }
 
@@ -113,6 +135,7 @@ public class EdgeMiner {
                 String node_id = node_ids.get(i);
                 double[] vector = item.getEmbedding().stream().mapToDouble(Float::doubleValue).toArray();
                 results.add(RowFactory.create(node_id, Vectors.dense(vector)));
+                i++;
             }
         }
     }
