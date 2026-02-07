@@ -19,12 +19,14 @@ import scala.Tuple2;
 public class FromOMOP {
     public static void main(String... args) {
         SparkSession spark = SparkSession.builder().getOrCreate();
+        String tag = spark.conf().get("spark.openhealthkg.run_tag", "OMOP");
+        int pruneThreshold = Integer.valueOf(spark.conf().get("spark.openhealthkg.prune_edges_at_rank", "100"));
         long cohortSize = spark.table("person")
                 .select(col("person_id"))
                 .distinct()
                 .count();
 
-        EdgeMiner miner = new EdgeMiner(new ChiSquared(), new MutualInformation(), new NormalizedGoogleDistance(), new JLH());
+        EdgeMiner miner = new EdgeMiner();
         // condition_occurrence: (person_id, condition_concept_id)
         Dataset<Row> cond = spark.table("condition_occurrence")
                 .select(
@@ -50,17 +52,16 @@ public class FromOMOP {
                 .where(col("node_id").isNotNull().and(col("node_id").notEqual("0")));
 
         // Union into node_id, occurrence_id format
-        Dataset<Row> nodeOccurrences = cond.unionByName(drug).unionByName(proc).distinct();
-        Tuple2<Dataset<Row>, Dataset<Row>> node_ids_compressed = Util.mapIDstoNumeric(nodeOccurrences, "node_id");
-        nodeOccurrences = node_ids_compressed._1;
-        Dataset<Row> node_id_mapping = node_ids_compressed._2;
-        node_id_mapping.coalesce(1).write().format("csv").save("node_id_mappings");
-        node_id_mapping.unpersist();
-        nodeOccurrences = Util.mapIDstoNumeric(nodeOccurrences, "occurrence_id")._1;
-        // Now actually get edge scores
-        Dataset<Row> df = miner.scoreTermPairs(nodeOccurrences, cohortSize);
-        // Write
-        df.write().saveAsTable("openhealthkg.edges");
+        Dataset<Row> nodeOccurrences = cond.unionByName(drug).unionByName(proc).distinct().withColumn("tag", lit(tag));
+        // Generate raw features
+        miner.generateEdgeFeatures(
+                spark,
+                "openhealthkg_data/raw/" + tag,
+                tag,
+                nodeOccurrences,
+                cohortSize,
+                pruneThreshold,
+                new MutualInformation(), new ChiSquared(), new NormalizedGoogleDistance(), new JLH());
 
     }
 

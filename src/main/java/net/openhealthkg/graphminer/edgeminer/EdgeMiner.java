@@ -8,8 +8,6 @@ import com.azure.ai.openai.models.*;
 import com.azure.core.credential.AzureKeyCredential;
 import net.openhealthkg.graphminer.Util;
 import net.openhealthkg.graphminer.heuristics.PXYHeuristic;
-import org.apache.hadoop.shaded.org.checkerframework.checker.units.qual.C;
-import org.apache.spark.Aggregator;
 import org.apache.spark.api.java.function.MapPartitionsFunction;
 import org.apache.spark.ml.Pipeline;
 import org.apache.spark.ml.PipelineStage;
@@ -26,29 +24,28 @@ import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.Metadata;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
-import org.apache.spark.storage.StorageLevel;
 import scala.Tuple2;
 
-import com.azure.ai.openai.OpenAIClient;
-import com.azure.ai.openai.OpenAIClientBuilder;
 import com.azure.ai.openai.models.Embeddings;
 import com.azure.ai.openai.models.EmbeddingsOptions;
-import com.azure.core.credential.AzureKeyCredential;
+
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collectors;
 
 public class EdgeMiner {
-    public Dataset<Row> mineEdges(Dataset<Row> df, long cohortSize, int keepTopN, PXYHeuristic... heuristics) {
+    public void generateEdgeFeatures(SparkSession spark, String persistenceDir, String tag, Dataset<Row> df, long cohortSize, int keepTopN, PXYHeuristic... heuristics) {
         cohortSize = cohortSize == 0 ? df.select("occurrence_id").distinct().count() : cohortSize;
         // Get a dataset of node IDs and names for the purposes of node description embeddings
-        Dataset<Row> nodeIDsAndDescs = df.select("node_id", "node_description").distinct().persist();
+        Dataset<Row> nodeNameVectors = getTextEmbeddingsForDescription(df.select("node_id", "node_description").distinct());
+        nodeNameVectors.write().parquet(persistenceDir + "/" + "node_desc_embeddings");
+        nodeNameVectors = spark.read().parquet(persistenceDir + "/" + "node_desc_embeddings");
         // Map to integer IDs for space and retain the mappings
         df = df.select("node_id", "occurrence_id").distinct();
         Tuple2<Dataset<Row>, Dataset<Row>> mapped = Util.mapIDstoNumeric(df, "node_id");
         df = mapped._1;
-        Dataset<Row> mappings = mapped._2.persist();
-        Map<String, String> externalNodeIDtoDescriptionMapping = new HashMap<>();
+        Dataset<Row> mappings = mapped._2;
+        mappings.write().parquet(persistenceDir + "/" + "source_node_id_to_vector_index");
+        mappings = spark.read().parquet(persistenceDir + "/" + "source_node_id_to_vector_index");
         long numNodes = mappings.count();
         df = Util.mapIDstoNumeric(df, "occurrence_id")._1; // We don't need to retain the original occurrence_id
         // Perform the actual scoring.
@@ -57,11 +54,13 @@ public class EdgeMiner {
         if (keepTopN > 0) {
             scoreTermPairs = keepTopN(scoreTermPairs, keepTopN);
         }
-        scoreTermPairs.persist(StorageLevel.DISK_ONLY()); // Persist this (very large) dataset to disk now that we are not doing any further ops TODO
+        scoreTermPairs.write().parquet(persistenceDir + "/" + "scored_node_pairs");
+        scoreTermPairs = spark.read().parquet(persistenceDir + "/" + "scored_node_pairs");
         Dataset<Row> pcaSimScoring = applyPCAonHeuristics(df, heuristics);
+        pcaSimScoring.write().parquet(persistenceDir + "/" + "pca_sim_scores");
+        pcaSimScoring = spark.read().parquet(persistenceDir + "/" + "pca_sim_scores");
         Dataset<Row> heuristicFeatureVectors = vectorizeHeuristics(scoreTermPairs, numNodes, heuristics);
-        Dataset<Row> nodeNameVectors = getTextEmbeddingsForDescription(mappings.withColumnRenamed("src_node_id", "node_id"));
-
+        heuristicFeatureVectors.write().parquet(persistenceDir + "/" + "heuristic_feature_vectors");
     }
 
     private Dataset<Row> getTextEmbeddingsForDescription(Dataset<Row> df) {
