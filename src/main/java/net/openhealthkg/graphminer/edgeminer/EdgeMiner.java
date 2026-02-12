@@ -4,10 +4,12 @@ import static org.apache.spark.sql.functions.*;
 
 import com.azure.ai.openai.OpenAIClient;
 import com.azure.ai.openai.OpenAIClientBuilder;
-import com.azure.ai.openai.models.*;
+import com.azure.ai.openai.models.EmbeddingItem;
 import com.azure.core.credential.AzureKeyCredential;
 import net.openhealthkg.graphminer.Util;
 import net.openhealthkg.graphminer.heuristics.PXYHeuristic;
+import org.apache.spark.api.java.function.MapFunction;
+import org.apache.spark.api.java.function.MapGroupsFunction;
 import org.apache.spark.api.java.function.MapPartitionsFunction;
 import org.apache.spark.ml.Pipeline;
 import org.apache.spark.ml.PipelineStage;
@@ -17,7 +19,9 @@ import org.apache.spark.ml.feature.VectorAssembler;
 import org.apache.spark.ml.linalg.SparseVector;
 import org.apache.spark.ml.linalg.VectorUDT;
 import org.apache.spark.ml.linalg.Vectors;
+import org.apache.spark.ml.linalg.Vector;
 import org.apache.spark.sql.*;
+import org.apache.spark.sql.api.java.UDF1;
 import org.apache.spark.sql.catalyst.encoders.RowEncoder;
 import org.apache.spark.sql.expressions.Window;
 import org.apache.spark.sql.types.DataTypes;
@@ -31,12 +35,18 @@ import com.azure.ai.openai.models.EmbeddingsOptions;
 
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 public class EdgeMiner {
     public void generateEdgeFeatures(SparkSession spark, String persistenceDir, String tag, Dataset<Row> df, long cohortSize, int keepTopN, PXYHeuristic... heuristics) {
+        spark.udf().register("vec_first", (UDF1<Vector, Double>) v ->
+                        (v == null || v.size() == 0) ? null : v.apply(0),
+                DataTypes.DoubleType
+        );
         cohortSize = cohortSize == 0 ? df.select("occurrence_id").distinct().count() : cohortSize;
         // Get a dataset of node IDs and names for the purposes of node description embeddings
-        Dataset<Row> nodeNameVectors = getTextEmbeddingsForDescription(df.select("node_id", "node_description").distinct());
+        df.select("tag", "node_id", "node_type", "node_description").distinct().write().parquet(persistenceDir + "/" + "node_metadata");
+        Dataset<Row> nodeNameVectors = getTextEmbeddingsForDescription(df.select("node_id",  "node_description").distinct().repartition(2));
         nodeNameVectors.write().parquet(persistenceDir + "/" + "node_desc_embeddings");
         nodeNameVectors = spark.read().parquet(persistenceDir + "/" + "node_desc_embeddings");
         // Map to integer IDs for space and retain the mappings
@@ -52,87 +62,69 @@ public class EdgeMiner {
         Dataset<Row> scoreTermPairs = scoreTermPairs(df, cohortSize, heuristics);
         // Filter top N scores
         if (keepTopN > 0) {
-            scoreTermPairs = keepTopN(scoreTermPairs, keepTopN);
+            scoreTermPairs = keepTopN(scoreTermPairs, keepTopN, heuristics);
         }
         scoreTermPairs.write().parquet(persistenceDir + "/" + "scored_node_pairs");
         scoreTermPairs = spark.read().parquet(persistenceDir + "/" + "scored_node_pairs");
-        Dataset<Row> pcaSimScoring = applyPCAonHeuristics(df, heuristics);
+        Dataset<Row> pcaSimScoring = applyPCAonHeuristics(scoreTermPairs, heuristics);
         pcaSimScoring.write().parquet(persistenceDir + "/" + "pca_sim_scores");
         pcaSimScoring = spark.read().parquet(persistenceDir + "/" + "pca_sim_scores");
         Dataset<Row> heuristicFeatureVectors = vectorizeHeuristics(scoreTermPairs, numNodes, heuristics);
         heuristicFeatureVectors.write().parquet(persistenceDir + "/" + "heuristic_feature_vectors");
     }
 
+    private static void processEmbeddingBatch(
+            OpenAIClient client,
+            List<String> nodeIds,
+            List<String> texts,
+            List<Row> out
+    ) {
+        EmbeddingsOptions options = new EmbeddingsOptions(texts);
+        Embeddings embeddings = client.getEmbeddings("text-embedding-3-large", options);
+
+        int i = 0;
+        for (EmbeddingItem item : embeddings.getData()) {
+            String nodeId = nodeIds.get(i++);
+            double[] vector = item.getEmbedding().stream().mapToDouble(Float::doubleValue).toArray();
+            out.add(RowFactory.create(nodeId, Vectors.dense(vector)));
+        }
+    }
+
     private Dataset<Row> getTextEmbeddingsForDescription(Dataset<Row> df) {
+        int BATCH_SIZE = 256;
         StructType schema = new StructType()
                 .add("node_id", DataTypes.StringType, false)
                 .add("node_embeddings", new VectorUDT(), false);
 
-        return df.mapPartitions(
-                (MapPartitionsFunction<Row, Row>) it -> new Iterator<Row>() {
+        return df.mapPartitions((MapPartitionsFunction<Row, Row>) it -> {
+            // executor-side; created once per partition
+            OpenAIClient client = new OpenAIClientBuilder()
+                    .credential(new AzureKeyCredential(System.getenv("AZURE_OPENAI_KEY")))
+                    .endpoint(System.getenv("AZURE_OPENAI_ENDPOINT"))
+                    .buildClient();
 
-                    private static final int BATCH_SIZE = 1024;
+            List<Row> out = new ArrayList<>();
+            List<String> nodeIds = new ArrayList<>(BATCH_SIZE);
+            List<String> texts = new ArrayList<>(BATCH_SIZE);
 
-                    private final List<Row> outputBuffer = new ArrayList<>();
-                    private boolean finished = false;
+            while (it.hasNext()) {
+                Row r = it.next();
+                nodeIds.add(r.getString(r.fieldIndex("node_id")));
+                texts.add(r.getString(r.fieldIndex("node_description")));
 
-                    @Override
-                    public boolean hasNext() {
-                        if (!outputBuffer.isEmpty()) {
-                            return true;
-                        }
-                        if (finished) {
-                            return false;
-                        }
-                        loadNextBatch();
-                        return !outputBuffer.isEmpty();
-                    }
+                if (nodeIds.size() >= BATCH_SIZE) {
+                    processEmbeddingBatch(client, nodeIds, texts, out);
+                    nodeIds.clear();
+                    texts.clear();
+                }
+            }
 
-                    @Override
-                    public Row next() {
-                        if (!hasNext()) {
-                            throw new NoSuchElementException();
-                        }
-                        return outputBuffer.remove(0);
-                    }
+            if (!nodeIds.isEmpty()) {
+                processEmbeddingBatch(client, nodeIds, texts, out);
+            }
 
-                    private void loadNextBatch() {
-                        List<String> nodeIds = new ArrayList<>(BATCH_SIZE);
-                        List<String> texts = new ArrayList<>(BATCH_SIZE);
-
-                        while (it.hasNext() && nodeIds.size() < BATCH_SIZE) {
-                            Row r = it.next();
-                            nodeIds.add(r.getString(r.fieldIndex("node_id")));
-                            texts.add(r.getString(r.fieldIndex("node_description")));
-                        }
-
-                        if (nodeIds.isEmpty()) {
-                            finished = true;
-                            return;
-                        }
-
-                        processEmbeddingBatch(nodeIds, texts, outputBuffer);
-                    }
-                },
-                RowEncoder.encoderFor(schema)
-        );
-    }
-
-    private void processEmbeddingBatch(List<String> node_ids, List<String> texts, List<Row> results) {
-        OpenAIClient client = new OpenAIClientBuilder()
-                .credential(new AzureKeyCredential(System.getenv("AZURE_OPENAI_KEY")))
-                .endpoint(System.getenv("AZURE_OPENAI_ENDPOINT"))
-                .buildClient();
-
-        EmbeddingsOptions options = new EmbeddingsOptions(texts);
-        Embeddings embeddings = client.getEmbeddings("text-embedding-3-large", options);
-        int i = 0;
-        for (EmbeddingItem item : embeddings.getData()) {
-            String node_id = node_ids.get(i);
-            double[] vector = item.getEmbedding().stream().mapToDouble(Float::doubleValue).toArray();
-            results.add(RowFactory.create(node_id, Vectors.dense(vector)));
-            i++;
-        }
+            return out.iterator();
+        }, RowEncoder.encoderFor(schema));
     }
 
 
@@ -144,15 +136,13 @@ public class EdgeMiner {
      * @return A dataframe consisting of x_node_id, y_node_id, and each heuristic
      */
     public Dataset<Row> scoreTermPairs(Dataset<Row> df, long cohortSize, PXYHeuristic... heuristics) {
-        Dataset<Row> nodeFreqs = df.groupBy("node_id").count();
+        Dataset<Row> nodeFreqs = df.groupBy("node_id").count().filter(col("count").geq(functions.lit(10))); // For de-identification safety and prevent rare from dominating correlations
 
         // Do a cartesian product to get all (x,y) combinations possible against which we build our frequency lists
-        Dataset<Row> nodes_x = df.select("node_id").distinct().withColumnRenamed("node_id", "x_node_id");
-        Dataset<Row> nodes_y = df.select("node_id").distinct().withColumnRenamed("node_id", "y_node_id");
+        Dataset<Row> nodes_x = nodeFreqs.select("node_id").withColumnRenamed("node_id", "x_node_id");
+        Dataset<Row> nodes_y = nodeFreqs.select("node_id").withColumnRenamed("node_id", "y_node_id");
         Dataset<Row> ret = nodes_x.crossJoin(
                 nodes_y
-        ).where(
-                col("x_node_id").lt(col("y_node_id")) //  prevent (x,y) and (y,x) both showing up
         ).select("x_node_id", "y_node_id");
 
         // Get x, y freqs
@@ -179,7 +169,10 @@ public class EdgeMiner {
                 ret.col("fx"),
                 coalesce(dfy.col("fy"), lit(0)).alias("fy")
         );
-        ret = ret.join(dfxy, ret.col("x_node_id").equalTo(dfxy.col("x_node_id").and(ret.col("y_node_id").equalTo(dfxy.col("y_node_id")))), "left").select(
+        ret = ret.join(
+                dfxy,
+                ret.col("x_node_id").equalTo(dfxy.col("x_node_id")).and(ret.col("y_node_id").equalTo(dfxy.col("y_node_id"))), "left"
+        ).select(
                 ret.col("x_node_id"),
                 ret.col("y_node_id"),
                 ret.col("fx"),
@@ -189,27 +182,46 @@ public class EdgeMiner {
 
         // Now calculate heuristics
         for (PXYHeuristic heuristic : heuristics) {
-            ret = ret.withColumn(heuristic.getHeuristicName() + "_raw", udf(heuristic, DataTypes.DoubleType).apply(ret.col("fx"), ret.col("fy"), ret.col("fxy"), ret.col("cohort_size")));
+            ret = ret.withColumn(
+                    heuristic.getHeuristicName() + "_raw",
+                    coalesce(udf(heuristic, DataTypes.DoubleType).apply(col("fx"), col("fy"), col("fxy"), col("cohort_size")), lit(0.0))
+            );
         }
-        // Now we need to re-scale to 0->1 w/ outlier handling. To do this, we do log scale divided by max log.
+        // Now we need to re-scale to 0->1 w/ outlier handling. To do this, we do signed log scale divided by signed max log.
         for (PXYHeuristic heuristic : heuristics) {
+
             String rawCol = heuristic.getHeuristicName() + "_raw";
             String scaledCol = heuristic.getHeuristicName();
 
-            Double maxLog = ret
-                    .select(max(log1p(col(rawCol))).alias("max_log"))
+            String signedLogCol = rawCol + "_signed_log";
+
+            ret = ret.withColumn(
+                    signedLogCol,
+                    signum(col(rawCol))
+                            .multiply(log1p(abs(col(rawCol))))
+            );
+
+            Double maxAbsLog = ret
+                    .select(max(abs(col(signedLogCol))).alias("max_abs_log"))
                     .first()
                     .getDouble(0);
 
-            if (maxLog == 0.0) {
-                ret = ret.withColumn(scaledCol, lit(0.0));
-                continue;
+            if (maxAbsLog == null || maxAbsLog == 0.0) {
+                ret = ret.withColumn(scaledCol, lit(0.5));
+            } else {
+
+                // normalize to [-1, 1]
+                Column normalized =
+                        col(signedLogCol).divide(lit(maxAbsLog));
+
+                // map to [0, 1]
+                ret = ret.withColumn(
+                        scaledCol,
+                        normalized.plus(1.0).divide(2.0)
+                );
             }
-            ret = ret.withColumn(
-                    scaledCol,
-                    when(col(rawCol).equalTo(0), lit(0.0))
-                            .otherwise(log1p(col(rawCol)).divide(lit(maxLog)))
-            );
+
+            ret = ret.drop(signedLogCol);
         }
         List<Column> finalCols = new ArrayList<>();
 
@@ -238,6 +250,7 @@ public class EdgeMiner {
      * @return
      */
     public Dataset<Row> applyPCAonHeuristics(Dataset<Row> df, PXYHeuristic... heuristics) {
+
         // logit scale heuristics
         final double eps = 1e-6;
         List<Column> projected = new ArrayList<>();
@@ -265,36 +278,37 @@ public class EdgeMiner {
                 .setK(1);
         // Actually run the PCA
         df = new Pipeline().setStages(new PipelineStage[] {assembler, scaler, pca}).fit(df).transform(df);
-        df = df.withColumn("sim_score", element_at(callUDF("vector_to_array", col("pca_vec")), 1));
+        df = df.withColumn("sim_score", callUDF("vec_first", col("pca_vec")));
         return df.select("x_node_id", "y_node_id", "sim_score");
 
     }
 
     public Dataset<Row> vectorizeHeuristics(Dataset<Row> df, long numNodes, PXYHeuristic... heuristics) {
-        return df.repartition(functions.col("x_node_id")).mapPartitions(
-                (Iterator<Row> it) -> {
+        return df.groupByKey(  (MapFunction<Row, Integer>) r -> r.getInt(r.fieldIndex("x_node_id")),
+                Encoders.INT()).mapGroups(
+                (MapGroupsFunction<Integer, Row, Row>) (xid, it) -> {
+                    Map<Integer, Double> valueMap = new HashMap<>();
                     List<Integer> indices = new ArrayList<>();
                     List<Double> values = new ArrayList<>();
-                    AtomicInteger x_node_id = new AtomicInteger(-1);
                     it.forEachRemaining(r -> {
-                        if (x_node_id.get() == -1) {
-                            x_node_id.set(Math.toIntExact(r.getLong(r.fieldIndex("x_node_id"))));
-                        }
-                        Integer offset = Math.toIntExact((r.getLong(r.fieldIndex("y_node_id")) - 1) * heuristics.length); // ID remapping uses row_number() which is 1-indexed
+                        Integer offset = (r.getInt(r.fieldIndex("y_node_id")) - 1) * heuristics.length; // ID remapping uses row_number() which is 1-indexed
                         int i = 0;
                         for (PXYHeuristic heuristic : heuristics) {
-                            indices.add(offset + i);
-                            values.add(r.getDouble(r.fieldIndex(heuristic.getHeuristicName())));
+                            valueMap.put(offset + i, r.getDouble(r.fieldIndex(heuristic.getHeuristicName())));
                             i++;
                         }
                     });
-                    return Collections.singleton(RowFactory.create(x_node_id, new SparseVector(Math.toIntExact(numNodes * heuristics.length), indices.stream().mapToInt(Integer::intValue).toArray(), values.stream().mapToDouble(Double::doubleValue).toArray()))).iterator();
+                    valueMap.keySet().stream().sorted().forEach(k -> {
+                        indices.add(k);
+                        values.add(valueMap.get(k));
+                    });
+                    return RowFactory.create(xid, new SparseVector(Math.toIntExact(numNodes * heuristics.length), indices.stream().mapToInt(Integer::intValue).toArray(), values.stream().mapToDouble(Double::doubleValue).toArray()));
                 },
                 RowEncoder.encoderFor(
                         new StructType(
                                 new StructField[]{
-                                        StructField.apply("x_node_id", DataTypes.LongType, false, Metadata.empty()),
-                                        StructField.apply("heurisitics_vector", new VectorUDT(), false, Metadata.empty())
+                                        StructField.apply("x_node_id", DataTypes.IntegerType, false, Metadata.empty()),
+                                        StructField.apply("heuristics_vector", new VectorUDT(), false, Metadata.empty())
                                 }
                         )
                 )
