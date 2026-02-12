@@ -22,9 +22,9 @@ public class Util {
         String[] columns = input.columns();
         Dataset<Row> mappingDF = input.select(column).distinct().withColumnRenamed(column, "src_" + column).withColumn("tgt_" + column, functions.row_number().over(Window.orderBy(functions.rand(123)))).persist(StorageLevel.DISK_ONLY()); // Persist the mapping DF for consistency
         Dataset<Row> outputDF = input.join(
-                mappingDF, input.col(column).equalTo(mappingDF.col("tgt_" + column))
+                mappingDF, input.col(column).equalTo(mappingDF.col("src_" + column))
         ).select(
-                Arrays.stream(columns).map(s -> s.equals(column) ? functions.col("tgt_" + column).alias(column) : functions.col(column)).toArray(Column[]::new)
+                Arrays.stream(columns).map(s -> s.equals(column) ? functions.col("tgt_" + column).alias(column) : functions.col(s)).toArray(Column[]::new)
         );
         return new Tuple2<>(outputDF, mappingDF);
     }
