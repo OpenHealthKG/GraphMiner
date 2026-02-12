@@ -14,7 +14,7 @@ public class JLH implements PXYHeuristic {
      */
     @Override
     public Double call(Long fx, Long fy, Long fxy, Long coll_size) throws Exception {
-        double pXY = (double)fxy / (double)coll_size;
+        double pXY = (double)fxy / (double)fy;
         double pX = (double)fx / (double)coll_size;
         return (pXY - pX) * (pXY/pX);
     }
