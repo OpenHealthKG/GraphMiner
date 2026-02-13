@@ -19,7 +19,7 @@ public class GenerateDatasetFromRaw {
         String persistence = spark.conf().get("spark.openhealthkg.persistence", "/data/awen2/projects/OpenHealthKG/openhealthkg_data/");
         String raw = persistence + "/raw/" + tag;
         String out = persistence + "/featurized_datasets/" + tag;
-        Dataset<Row> pairs = spark.read().parquet(raw + "/scored_term_pairs").select("x_node_id", "y_node_id").distinct();
+        Dataset<Row> pairs = spark.read().parquet(raw + "/scored_node_pairs").select("x_node_id", "y_node_id").distinct();
         // Construct similarity score metrics for node description embeddings
         // - First load embedding vectors and map to internal vectors
         Dataset<Row> embeddings = spark.read().parquet(raw + "/node_desc_embeddings");
@@ -27,12 +27,12 @@ public class GenerateDatasetFromRaw {
         embeddings = embeddings.join(mappings, embeddings.col("node_id").equalTo(mappings.col("tgt_node_id"))).select(mappings.col("tgt_node_id").alias("node_id"), embeddings.col("node_embeddings"));
         // - Now join against pairs to get embeddings for each
         Dataset<Row> pairsWithEmbeddings = pairs
-                .join(embeddings, pairs.col("x_node_id").equalTo(embeddings.col("node_id")))
+                .join(embeddings.as("x_embeddings"), pairs.col("x_node_id").equalTo(col("x_embeddings.node_id")))
                 .join(embeddings.as("y_embeddings"), pairs.col("y_node_id").equalTo(col("y_embeddings.node_id")))
                 .select(
                         pairs.col("x_node_id"),
                         pairs.col("y_node_id"),
-                        embeddings.col("node_embeddings").alias("x_node_embedding"),
+                        col("x_embeddings.node_embeddings").alias("x_node_embedding"),
                         col("y_embeddings.node_embeddings").alias("y_node_embedding")
                 );
         // - Now calculate vector distance
@@ -79,8 +79,8 @@ public class GenerateDatasetFromRaw {
                     return sum;
                 }, DataTypes.DoubleType).apply(col("x_node_embedding"), col("y_node_embedding")).as("manhattan_distance")
         );
-        distances.write().mode("overwrite").parquet(out + "/vector_distances");
-        distances = spark.read().parquet(out + "/vector_distances");
+        distances.write().mode("overwrite").parquet(raw + "/vector_distances");
+        distances = spark.read().parquet(raw + "/vector_distances");
         Dataset<Row> heuristics = spark.read().parquet(raw + "/heuristic_feature_vectors");
         Dataset<Row> pcaSimScoring = spark.read().parquet(raw + "/pca_sim_scores");
         // Create feature vectors for x, y pairs and write
@@ -105,17 +105,9 @@ public class GenerateDatasetFromRaw {
         ).join(
                 pcaSimScoring,
                 pairs.col("x_node_id").equalTo(pcaSimScoring.col("x_node_id")).and(pairs.col("y_node_id").equalTo(pcaSimScoring.col("y_node_id")))
-        );
-        df.join(
-                mappings.select(col("tgt_node_id"), col("src_node_id").alias("x_source_node_id")),
-                df.col("x_node_id").equalTo(col("tgt_node_id"))
-        ).join(
-                mappings.select(col("tgt_node_id"), col("src_node_id").alias("y_source_node_id")),
-                df.col("y_node_id").equalTo(col("tgt_node_id"))
         ).select(
-                lit(tag).alias("tag"),
-                col("x_source_node_id").alias("x_node_id"),
-                col("y_source_node_id").alias("y_node_id"),
+                pairs.col("x_node_id"),
+                pairs.col("y_node_id"),
                 distances.col("cos_sim"),
                 distances.col("euclidean_distance"),
                 distances.col("dot_product"),
@@ -123,6 +115,23 @@ public class GenerateDatasetFromRaw {
                 pcaSimScoring.col("sim_score"),
                 heuristics.col("heuristics_vector")
         );
+        df.join(
+                mappings.as("mappings_x"),
+                df.col("x_node_id").equalTo(col("mappings_x.tgt_node_id"))
+        ).join(
+                mappings.as("mappings_y"),
+                df.col("y_node_id").equalTo(col("mappings_y.tgt_node_id"))
+        ).select(
+                lit(tag).alias("tag"),
+                col("mappings_x.src_node_id").alias("x_node_id"),
+                col("mappings_y.src_node_id").alias("y_node_id"),
+                distances.col("cos_sim"),
+                distances.col("euclidean_distance"),
+                distances.col("dot_product"),
+                distances.col("manhattan_distance"),
+                pcaSimScoring.col("sim_score"),
+                heuristics.col("heuristics_vector")
+        ).write().parquet(out + "/full_dataset_vectors");
         
     }
     
