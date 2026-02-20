@@ -53,17 +53,41 @@ public class FromOMOP {
 
         // Union into node_id, occurrence_id format
         Dataset<Row> nodeOccurrences = cond.unionByName(drug).unionByName(proc).distinct().withColumn("tag", lit(tag));
+
+        // Load concept relationships
+        Dataset<Row> relationships = spark.table("concept_relationship")
+                .select(
+                        col("concept_id_1").cast("string").alias("src_node_id"),
+                        col("concept_id_2").cast("string").alias("tgt_node_id"),
+                        col("relationship_id").alias("edge_label")
+                );
+
+        // Generate edge labels from concept relationships
+        Dataset<Row> edgeLabels = relationships
+                .join(nodeOccurrences.select("node_id").distinct().alias("source"),
+                        col("src_node_id").equalTo(col("source.node_id")))
+                .join(nodeOccurrences.select("node_id").distinct().alias("target"),
+                        col("tgt_node_id").equalTo(col("target.node_id")))
+                .select("src_node_id", "tgt_node_id", "edge_label")
+                .distinct();
+
+        // Save edge labels
+        edgeLabels.write().mode("overwrite").parquet("openhealthkg_data/raw/" + tag + "/labels");
+
         // Generate raw features
         miner.generateEdgeFeatures(
                 spark,
                 "openhealthkg_data/raw/" + tag,
                 tag,
                 nodeOccurrences,
+                edgeLabels,
                 cohortSize,
                 pruneThreshold,
                 new MutualInformation(), new ChiSquared(), new NormalizedGoogleDistance(), new JLH());
 
     }
+    
+    
 
 
 }

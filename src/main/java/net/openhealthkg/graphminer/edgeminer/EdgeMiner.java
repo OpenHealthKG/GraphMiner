@@ -16,12 +16,11 @@ import org.apache.spark.ml.PipelineStage;
 import org.apache.spark.ml.feature.PCA;
 import org.apache.spark.ml.feature.StandardScaler;
 import org.apache.spark.ml.feature.VectorAssembler;
-import org.apache.spark.ml.linalg.SparseVector;
-import org.apache.spark.ml.linalg.VectorUDT;
-import org.apache.spark.ml.linalg.Vectors;
+import org.apache.spark.ml.linalg.*;
 import org.apache.spark.ml.linalg.Vector;
 import org.apache.spark.sql.*;
 import org.apache.spark.sql.api.java.UDF1;
+import org.apache.spark.sql.api.java.UDF2;
 import org.apache.spark.sql.catalyst.encoders.RowEncoder;
 import org.apache.spark.sql.expressions.Window;
 import org.apache.spark.sql.types.DataTypes;
@@ -38,24 +37,25 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 public class EdgeMiner {
-    public void generateEdgeFeatures(SparkSession spark, String persistenceDir, String tag, Dataset<Row> df, long cohortSize, int keepTopN, PXYHeuristic... heuristics) {
+    public void generateEdgeFeatures(SparkSession spark, String persistence, String tag, Dataset<Row> df, Dataset<Row> labels, long cohortSize, int keepTopN, PXYHeuristic... heuristics) {
         spark.udf().register("vec_first", (UDF1<Vector, Double>) v ->
                         (v == null || v.size() == 0) ? null : v.apply(0),
                 DataTypes.DoubleType
         );
         cohortSize = cohortSize == 0 ? df.select("occurrence_id").distinct().count() : cohortSize;
+        String raw = persistence + "/raw/" + tag;
         // Get a dataset of node IDs and names for the purposes of node description embeddings
-        df.select("tag", "node_id", "node_type", "node_description").distinct().write().parquet(persistenceDir + "/" + "node_metadata");
-        Dataset<Row> nodeNameVectors = getTextEmbeddingsForDescription(df.select("node_id",  "node_description").distinct().repartition(2));
-        nodeNameVectors.write().parquet(persistenceDir + "/" + "node_desc_embeddings");
-        nodeNameVectors = spark.read().parquet(persistenceDir + "/" + "node_desc_embeddings");
+        df.select("tag", "node_id", "node_type", "node_description").distinct().write().parquet(raw + "/node_metadata");
+        Dataset<Row> nodeNameVectors = getTextEmbeddingsForDescription(df.select("node_id", "node_description").distinct().repartition(2));
+        nodeNameVectors.write().parquet(raw + "/node_desc_embeddings");
+        nodeNameVectors = spark.read().parquet(raw + "/node_desc_embeddings");
         // Map to integer IDs for space and retain the mappings
         df = df.select("node_id", "occurrence_id").distinct();
         Tuple2<Dataset<Row>, Dataset<Row>> mapped = Util.mapIDstoNumeric(df, "node_id");
         df = mapped._1;
         Dataset<Row> mappings = mapped._2;
-        mappings.write().parquet(persistenceDir + "/" + "source_node_id_to_vector_index");
-        mappings = spark.read().parquet(persistenceDir + "/" + "source_node_id_to_vector_index");
+        mappings.write().parquet(raw + "/source_node_id_to_vector_index");
+        mappings = spark.read().parquet(raw + "/source_node_id_to_vector_index");
         long numNodes = mappings.count();
         df = Util.mapIDstoNumeric(df, "occurrence_id")._1; // We don't need to retain the original occurrence_id
         // Perform the actual scoring.
@@ -64,13 +64,157 @@ public class EdgeMiner {
         if (keepTopN > 0) {
             scoreTermPairs = keepTopN(scoreTermPairs, keepTopN, heuristics);
         }
-        scoreTermPairs.write().parquet(persistenceDir + "/" + "scored_node_pairs");
-        scoreTermPairs = spark.read().parquet(persistenceDir + "/" + "scored_node_pairs");
+        scoreTermPairs.write().parquet(raw + "/scored_node_pairs");
+        scoreTermPairs = spark.read().parquet(raw + "/scored_node_pairs");
         Dataset<Row> pcaSimScoring = applyPCAonHeuristics(scoreTermPairs, heuristics);
-        pcaSimScoring.write().parquet(persistenceDir + "/" + "pca_sim_scores");
-        pcaSimScoring = spark.read().parquet(persistenceDir + "/" + "pca_sim_scores");
+        pcaSimScoring.write().parquet(raw + "/pca_sim_scores");
+        pcaSimScoring = spark.read().parquet(raw + "/pca_sim_scores");
         Dataset<Row> heuristicFeatureVectors = vectorizeHeuristics(scoreTermPairs, numNodes, heuristics);
-        heuristicFeatureVectors.write().parquet(persistenceDir + "/" + "heuristic_feature_vectors");
+        heuristicFeatureVectors.write().parquet(raw + "/heuristic_feature_vectors");
+        heuristicFeatureVectors = spark.read().parquet(raw + "/heuristic_feature_vectors");
+        Tuple2<Dataset<Row>, Dataset<Row>> mappedLabels = Util.mapIDstoNumeric(labels, "edge_label");
+        labels = mappedLabels._1;
+        mappedLabels._2.withColumn("edge_label_reindexed", col("edge_label").plus(functions.lit(1))).write().parquet(raw + "/label_id_to_vector_index");
+        labels = labels.join(
+                mappings.alias("mappings_src"),
+                labels.col("src_node_id").equalTo(mappings.col("mappings_src.src_node_id")),
+                "inner"
+        ).join(
+                mappings.alias("mappings_tgt"),
+                labels.col("tgt_node_id_").equalTo(mappings.col("mappings_tgt.src_node_id"))
+        ).select(
+                col("mappings_src.tgt_node_id").alias("src_node_id"),
+                col("mappings_tgt.tgt_node_id").alias("tgt_node_id"),
+                labels.col("edge_label").plus(functions.lit(1)).alias("edge_label")
+        );
+        labels.write().parquet(raw + "/labels");
+        labels = spark.read().parquet(raw + "/labels");
+        String datasets = persistence + "/featurized_datasets/" + tag;
+        Dataset<Row> pairs = spark.read().parquet(raw + "/scored_node_pairs").select("x_node_id", "y_node_id").distinct();
+        // Construct similarity score metrics for node description embeddings
+        // - First load embedding vectors and map to internal vectors
+        Dataset<Row> embeddings = spark.read().parquet(raw + "/node_desc_embeddings");
+        embeddings = embeddings.join(mappings, embeddings.col("node_id").equalTo(mappings.col("tgt_node_id"))).select(mappings.col("tgt_node_id").alias("node_id"), embeddings.col("node_embeddings"));
+        // - Now join against pairs to get embeddings for each
+        Dataset<Row> pairsWithEmbeddings = pairs
+                .join(embeddings.as("x_embeddings"), pairs.col("x_node_id").equalTo(col("x_embeddings.node_id")))
+                .join(embeddings.as("y_embeddings"), pairs.col("y_node_id").equalTo(col("y_embeddings.node_id")))
+                .select(
+                        pairs.col("x_node_id"),
+                        pairs.col("y_node_id"),
+                        col("x_embeddings.node_embeddings").alias("x_node_embedding"),
+                        col("y_embeddings.node_embeddings").alias("y_node_embedding")
+                );
+        // - Now calculate vector distance
+        Dataset<Row> distances = pairsWithEmbeddings.select(
+                col("x_node_id"),
+                col("y_node_id"),
+                // Cosine similarity
+                functions.udf((UDF2<Vector, Vector, Double>) (v1, v2) -> {
+                    if (v1 == null || v2 == null) return null;
+                    if (v1.size() != v2.size()) throw new IllegalArgumentException("Vector size mismatch");
+                    double denom = Vectors.norm(v1, 2.0) * Vectors.norm(v2, 2.0);
+                    if (denom == 0.0) return null; // undefined if either vector is zero
+                    return BLAS.dot(v1, v2) / denom;
+                }, DataTypes.DoubleType).apply(col("x_node_embedding"), col("y_node_embedding")).as("cos_sim"),
+                // Euclidean distance
+                functions.udf(
+                        (UDF2<Vector, Vector, Double>) (v1, v2) -> {
+                            if (v1 == null || v2 == null) return null;
+                            if (v1.size() != v2.size()) throw new IllegalArgumentException("Vector size mismatch");
+
+                            double[] aa = v1.toArray();
+                            double[] bb = v2.toArray();
+
+                            double sumSq = 0.0;
+                            for (int i = 0; i < aa.length; i++) {
+                                double d = aa[i] - bb[i];
+                                sumSq += d * d;
+                            }
+                            return Math.sqrt(sumSq);
+                        }, DataTypes.DoubleType
+                ).apply(col("x_node_embedding"), col("y_node_embedding")).as("euclidean_distance"),
+                // Dot product
+                functions.udf((UDF2<Vector, Vector, Double>) BLAS::dot, DataTypes.DoubleType).apply(col("x_node_embedding"), col("y_node_embedding")).as("dot_product"),
+                // Manhattan distance
+                functions.udf((UDF2<Vector, Vector, Double>) (v1, v2) -> {
+                    if (v1 == null || v2 == null) return null;
+                    if (v1.size() != v2.size()) throw new IllegalArgumentException("Vector size mismatch");
+
+                    double[] aa = v1.toArray();
+                    double[] bb = v2.toArray();
+
+                    double sum = 0.0;
+                    for (int i = 0; i < aa.length; i++) sum += Math.abs(aa[i] - bb[i]);
+                    return sum;
+                }, DataTypes.DoubleType).apply(col("x_node_embedding"), col("y_node_embedding")).as("manhattan_distance")
+        );
+        distances.write().mode("overwrite").parquet(raw + "/vector_distances");
+        distances = spark.read().parquet(raw + "/vector_distances");
+        // Create feature vectors for x, y pairs and write
+        df = pairs.join(distances, pairs.col("x_node_id").equalTo(distances.col("x_node_id")).and(pairs.col("y_node_id").equalTo(distances.col("y_node_id")))).select(
+                pairs.col("x_node_id"),
+                pairs.col("y_node_id"),
+                distances.col("cos_sim"),
+                distances.col("euclidean_distance"),
+                distances.col("dot_product"),
+                distances.col("manhattan_distance")
+        ).join(
+                heuristicFeatureVectors,
+                pairs.col("x_node_id").equalTo(heuristicFeatureVectors.col("x_node_id"))
+        ).select(
+                pairs.col("x_node_id"),
+                pairs.col("y_node_id"),
+                distances.col("cos_sim"),
+                distances.col("euclidean_distance"),
+                distances.col("dot_product"),
+                distances.col("manhattan_distance"),
+                heuristicFeatureVectors.col("heuristics_vector")
+        ).join(
+                pcaSimScoring,
+                pairs.col("x_node_id").equalTo(pcaSimScoring.col("x_node_id")).and(pairs.col("y_node_id").equalTo(pcaSimScoring.col("y_node_id")))
+        ).select(
+                pairs.col("x_node_id"),
+                pairs.col("y_node_id"),
+                distances.col("cos_sim"),
+                distances.col("euclidean_distance"),
+                distances.col("dot_product"),
+                distances.col("manhattan_distance"),
+                pcaSimScoring.col("sim_score"),
+                heuristicFeatureVectors.col("heuristics_vector")
+        ).join(
+                labels,
+                pairs.col("x_node_id").equalTo(labels.col("src_node_id")).and(pairs.col("y_node_id").equalTo(labels.col("tgt_node_id_"))),
+                "left"
+        ).select(
+                pairs.col("x_node_id"),
+                pairs.col("y_node_id"),
+                distances.col("cos_sim"),
+                distances.col("euclidean_distance"),
+                distances.col("dot_product"),
+                distances.col("manhattan_distance"),
+                pcaSimScoring.col("sim_score"),
+                heuristicFeatureVectors.col("heuristics_vector"),
+                functions.coalesce(labels.col("edge_label"), lit(0)).alias("edge_label")
+        );
+        df.join(
+                mappings.as("mappings_x"),
+                df.col("x_node_id").equalTo(col("mappings_x.tgt_node_id"))
+        ).join(
+                mappings.as("mappings_y"),
+                df.col("y_node_id").equalTo(col("mappings_y.tgt_node_id"))
+        ).select(
+                lit(tag).alias("tag"),
+                col("mappings_x.src_node_id").alias("x_node_id"),
+                col("mappings_y.src_node_id").alias("y_node_id"),
+                distances.col("cos_sim"),
+                distances.col("euclidean_distance"),
+                distances.col("dot_product"),
+                distances.col("manhattan_distance"),
+                pcaSimScoring.col("sim_score"),
+                heuristicFeatureVectors.col("heuristics_vector")
+        ).write().parquet(datasets + "/full_dataset_vectors");
+
     }
 
     private static void processEmbeddingBatch(
@@ -97,7 +241,6 @@ public class EdgeMiner {
                 .add("node_embeddings", new VectorUDT(), false);
 
         return df.mapPartitions((MapPartitionsFunction<Row, Row>) it -> {
-            // executor-side; created once per partition
             OpenAIClient client = new OpenAIClientBuilder()
                     .credential(new AzureKeyCredential(System.getenv("AZURE_OPENAI_KEY")))
                     .endpoint(System.getenv("AZURE_OPENAI_ENDPOINT"))
@@ -129,8 +272,8 @@ public class EdgeMiner {
 
 
     /**
-     * @param df An input data frame consisting of (at a minimum) a string term/node identifier (located in the
-     *           node_id column) and a string occurrence (document/patient) identifier.
+     * @param df         An input data frame consisting of (at a minimum) a string term/node identifier (located in the
+     *                   node_id column) and a string occurrence (document/patient) identifier.
      * @param cohortSize cohort size
      * @param heuristics the Heuristics to use
      * @return A dataframe consisting of x_node_id, y_node_id, and each heuristic
@@ -141,9 +284,7 @@ public class EdgeMiner {
         // Do a cartesian product to get all (x,y) combinations possible against which we build our frequency lists
         Dataset<Row> nodes_x = nodeFreqs.select("node_id").withColumnRenamed("node_id", "x_node_id");
         Dataset<Row> nodes_y = nodeFreqs.select("node_id").withColumnRenamed("node_id", "y_node_id");
-        Dataset<Row> ret = nodes_x.crossJoin(
-                nodes_y
-        ).select("x_node_id", "y_node_id");
+        Dataset<Row> ret = nodes_x.crossJoin(nodes_y).select("x_node_id", "y_node_id");
 
         // Get x, y freqs
         Dataset<Row> dfx = nodeFreqs.withColumnRenamed("node_id", "x_node_id").withColumnRenamed("count", "fx");
@@ -242,9 +383,9 @@ public class EdgeMiner {
         ).filter(functions.col("min_rank").isNotNull().and(functions.col("min_rank").leq(functions.lit(n)))).drop("min_rank");
     }
 
-
     /**
      * Calculates PC1 score for an x/y pair for the purposes of learning a generic sim_score
+     *
      * @param df
      * @param heuristics
      * @return
@@ -257,7 +398,7 @@ public class EdgeMiner {
         projected.add(col("x_node_id"));
         projected.add(col("y_node_id"));
         for (PXYHeuristic heuristic : heuristics) {
-            Column clipped = greatest(least(col(heuristic.getHeuristicName()), lit(1.0-eps)), lit(eps));
+            Column clipped = greatest(least(col(heuristic.getHeuristicName()), lit(1.0 - eps)), lit(eps));
             Column logit = log(clipped.divide(lit(1.0).minus(clipped))).alias(heuristic.getHeuristicName() + "_logit");
             projected.add(logit);
         }
@@ -277,14 +418,13 @@ public class EdgeMiner {
                 .setOutputCol("pca_vec")
                 .setK(1);
         // Actually run the PCA
-        df = new Pipeline().setStages(new PipelineStage[] {assembler, scaler, pca}).fit(df).transform(df);
+        df = new Pipeline().setStages(new PipelineStage[]{assembler, scaler, pca}).fit(df).transform(df);
         df = df.withColumn("sim_score", callUDF("vec_first", col("pca_vec")));
         return df.select("x_node_id", "y_node_id", "sim_score");
-
     }
 
     public Dataset<Row> vectorizeHeuristics(Dataset<Row> df, long numNodes, PXYHeuristic... heuristics) {
-        return df.groupByKey(  (MapFunction<Row, Integer>) r -> r.getInt(r.fieldIndex("x_node_id")),
+        return df.groupByKey((MapFunction<Row, Integer>) r -> r.getInt(r.fieldIndex("x_node_id")),
                 Encoders.INT()).mapGroups(
                 (MapGroupsFunction<Integer, Row, Row>) (xid, it) -> {
                     Map<Integer, Double> valueMap = new HashMap<>();
