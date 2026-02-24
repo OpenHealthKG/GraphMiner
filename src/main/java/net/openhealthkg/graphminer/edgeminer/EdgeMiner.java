@@ -74,7 +74,7 @@ public class EdgeMiner {
         heuristicFeatureVectors = spark.read().parquet(raw + "/heuristic_feature_vectors");
         Tuple2<Dataset<Row>, Dataset<Row>> mappedLabels = Util.mapIDstoNumeric(labels, "edge_label");
         labels = mappedLabels._1;
-        mappedLabels._2.withColumn("edge_label_reindexed", col("edge_label").plus(functions.lit(1))).write().parquet(raw + "/label_id_to_vector_index");
+        mappedLabels._2.withColumn("edge_label_reindexed", col("tgt_edge_label").plus(functions.lit(1))).drop("tgt_edge_label").withColumnRenamed("edge_label_reindexed", "tgt_edge_label").write().parquet(raw + "/label_id_to_vector_index");
         labels = labels.join(
                 mappings.alias("mappings_src"),
                 labels.col("src_node_id").equalTo(mappings.col("mappings_src.src_node_id")),
