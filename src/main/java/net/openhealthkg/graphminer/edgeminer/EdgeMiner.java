@@ -125,11 +125,11 @@ public class EdgeMiner {
             }
             labels = labels.join(
                     mappings.alias("mappings_src"),
-                    labels.col("src_node_id").equalTo(mappings.col("mappings_src.src_node_id")),
+                    labels.col("src_node_id").equalTo(col("mappings_src.src_node_id")),
                     "inner"
             ).join(
                     mappings.alias("mappings_tgt"),
-                    labels.col("tgt_node_id_").equalTo(mappings.col("mappings_tgt.src_node_id"))
+                    labels.col("tgt_node_id").equalTo(col("mappings_tgt.src_node_id"))
             ).select(
                     col("mappings_src.tgt_node_id").alias("src_node_id"),
                     col("mappings_tgt.tgt_node_id").alias("tgt_node_id"),
@@ -210,17 +210,6 @@ public class EdgeMiner {
                 distances.col("dot_product"),
                 distances.col("manhattan_distance")
         ).join(
-                heuristicFeatureVectors,
-                pairs.col("x_node_id").equalTo(heuristicFeatureVectors.col("x_node_id"))
-        ).select(
-                pairs.col("x_node_id"),
-                pairs.col("y_node_id"),
-                distances.col("cos_sim"),
-                distances.col("euclidean_distance"),
-                distances.col("dot_product"),
-                distances.col("manhattan_distance"),
-                heuristicFeatureVectors.col("heuristics_vector")
-        ).join(
                 pcaSimScoring,
                 pairs.col("x_node_id").equalTo(pcaSimScoring.col("x_node_id")).and(pairs.col("y_node_id").equalTo(pcaSimScoring.col("y_node_id")))
         ).select(
@@ -230,11 +219,10 @@ public class EdgeMiner {
                 distances.col("euclidean_distance"),
                 distances.col("dot_product"),
                 distances.col("manhattan_distance"),
-                pcaSimScoring.col("sim_score"),
-                heuristicFeatureVectors.col("heuristics_vector")
+                pcaSimScoring.col("sim_score")
         ).join(
                 labels,
-                pairs.col("x_node_id").equalTo(labels.col("src_node_id")).and(pairs.col("y_node_id").equalTo(labels.col("tgt_node_id_"))),
+                pairs.col("x_node_id").equalTo(labels.col("src_node_id")).and(pairs.col("y_node_id").equalTo(labels.col("tgt_node_id"))),
                 "left"
         ).select(
                 pairs.col("x_node_id"),
@@ -244,7 +232,6 @@ public class EdgeMiner {
                 distances.col("dot_product"),
                 distances.col("manhattan_distance"),
                 pcaSimScoring.col("sim_score"),
-                heuristicFeatureVectors.col("heuristics_vector"),
                 functions.coalesce(labels.col("edge_label"), lit(0)).alias("edge_label")
         );
         df.join(
@@ -262,7 +249,7 @@ public class EdgeMiner {
                 distances.col("dot_product"),
                 distances.col("manhattan_distance"),
                 pcaSimScoring.col("sim_score"),
-                heuristicFeatureVectors.col("heuristics_vector")
+                col("edge_label")
         ).write().parquet(datasets + "/full_dataset_vectors");
     }
 
