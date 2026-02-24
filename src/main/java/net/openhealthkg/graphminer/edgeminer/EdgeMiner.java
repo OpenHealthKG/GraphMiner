@@ -45,50 +45,100 @@ public class EdgeMiner {
         cohortSize = cohortSize == 0 ? df.select("occurrence_id").distinct().count() : cohortSize;
         String raw = persistence + "/raw/" + tag;
         // Get a dataset of node IDs and names for the purposes of node description embeddings
-        df.select("tag", "node_id", "node_type", "node_description").distinct().write().parquet(raw + "/node_metadata");
-        Dataset<Row> nodeNameVectors = getTextEmbeddingsForDescription(df.select("node_id", "node_description").distinct().repartition(2));
-        nodeNameVectors.write().parquet(raw + "/node_desc_embeddings");
+        if (!new java.io.File(raw + "/node_metadata").exists()) {
+            df.select("tag", "node_id", "node_type", "node_description").distinct().write().parquet(raw + "/node_metadata");
+        }
+        Dataset<Row> nodeNameVectors;
+        if (!new java.io.File(raw + "/node_desc_embeddings").exists()) {
+            nodeNameVectors = getTextEmbeddingsForDescription(df.select("node_id", "node_description").distinct().repartition(2));
+            nodeNameVectors.write().parquet(raw + "/node_desc_embeddings");
+        }
         nodeNameVectors = spark.read().parquet(raw + "/node_desc_embeddings");
+
         // Map to integer IDs for space and retain the mappings
-        df = df.select("node_id", "occurrence_id").distinct();
-        Tuple2<Dataset<Row>, Dataset<Row>> mapped = Util.mapIDstoNumeric(df, "node_id");
-        df = mapped._1;
-        Dataset<Row> mappings = mapped._2;
-        mappings.write().parquet(raw + "/source_node_id_to_vector_index");
-        mappings = spark.read().parquet(raw + "/source_node_id_to_vector_index");
+        Dataset<Row> mappings;
+        if (!new java.io.File(raw + "/source_node_id_to_vector_index").exists()) {
+            df = df.select("node_id", "occurrence_id").distinct();
+            Tuple2<Dataset<Row>, Dataset<Row>> mapped = Util.mapIDstoNumeric(df, "node_id");
+            df = mapped._1;
+            mappings = mapped._2;
+            mappings.write().parquet(raw + "/source_node_id_to_vector_index");
+            mappings = spark.read().parquet(raw + "/source_node_id_to_vector_index");
+        } else {
+            mappings = spark.read().parquet(raw + "/source_node_id_to_vector_index");
+            // reapply mappings to df
+            df = df.join(mappings, df.col("node_id").equalTo(mappings.col("src_node_id"))
+            ).drop(df.col("node_id")).drop(mappings.col("src_node_id")).select(
+                    mappings.col("tgt_node_id").alias("node_id"),
+                    df.col("occurrence_id")
+            );
+        }
+
         long numNodes = mappings.count();
         df = Util.mapIDstoNumeric(df, "occurrence_id")._1; // We don't need to retain the original occurrence_id
         // Perform the actual scoring.
-        Dataset<Row> scoreTermPairs = scoreTermPairs(df, cohortSize, heuristics);
-        // Filter top N scores
-        if (keepTopN > 0) {
-            scoreTermPairs = keepTopN(scoreTermPairs, keepTopN, heuristics);
+        Dataset<Row> scoreTermPairs;
+        if (!new java.io.File(raw + "/scored_node_pairs").exists()) {
+            scoreTermPairs = scoreTermPairs(df, cohortSize, heuristics);
+            // Filter top N scores
+            if (keepTopN > 0) {
+                scoreTermPairs = keepTopN(scoreTermPairs, keepTopN, heuristics);
+            }
+            scoreTermPairs.write().parquet(raw + "/scored_node_pairs");
         }
-        scoreTermPairs.write().parquet(raw + "/scored_node_pairs");
         scoreTermPairs = spark.read().parquet(raw + "/scored_node_pairs");
-        Dataset<Row> pcaSimScoring = applyPCAonHeuristics(scoreTermPairs, heuristics);
-        pcaSimScoring.write().parquet(raw + "/pca_sim_scores");
+        Dataset<Row> pcaSimScoring;
+        if (!new java.io.File(raw + "/pca_sim_scores").exists()) {
+            pcaSimScoring = applyPCAonHeuristics(scoreTermPairs, heuristics);
+            pcaSimScoring.write().parquet(raw + "/pca_sim_scores");
+        }
         pcaSimScoring = spark.read().parquet(raw + "/pca_sim_scores");
-        Dataset<Row> heuristicFeatureVectors = vectorizeHeuristics(scoreTermPairs, numNodes, heuristics);
-        heuristicFeatureVectors.write().parquet(raw + "/heuristic_feature_vectors");
+        Dataset<Row> heuristicFeatureVectors;
+        if (!new java.io.File(raw + "/heuristic_feature_vectors").exists()) {
+            heuristicFeatureVectors = vectorizeHeuristics(scoreTermPairs, numNodes, heuristics);
+            heuristicFeatureVectors.write().parquet(raw + "/heuristic_feature_vectors");
+        }
         heuristicFeatureVectors = spark.read().parquet(raw + "/heuristic_feature_vectors");
-        Tuple2<Dataset<Row>, Dataset<Row>> mappedLabels = Util.mapIDstoNumeric(labels, "edge_label");
-        labels = mappedLabels._1;
-        mappedLabels._2.withColumn("edge_label_reindexed", col("tgt_edge_label").plus(functions.lit(1))).drop("tgt_edge_label").withColumnRenamed("edge_label_reindexed", "tgt_edge_label").write().parquet(raw + "/label_id_to_vector_index");
-        labels = labels.join(
-                mappings.alias("mappings_src"),
-                labels.col("src_node_id").equalTo(mappings.col("mappings_src.src_node_id")),
-                "inner"
-        ).join(
-                mappings.alias("mappings_tgt"),
-                labels.col("tgt_node_id_").equalTo(mappings.col("mappings_tgt.src_node_id"))
-        ).select(
-                col("mappings_src.tgt_node_id").alias("src_node_id"),
-                col("mappings_tgt.tgt_node_id").alias("tgt_node_id"),
-                labels.col("edge_label").plus(functions.lit(1)).alias("edge_label")
-        );
-        labels.write().parquet(raw + "/labels");
+
+
+        if (!new java.io.File(raw + "/labels").exists()) {
+            if (!new java.io.File(raw + "/label_id_to_vector_index").exists()) {
+                Tuple2<Dataset<Row>, Dataset<Row>> mappedLabels = Util.mapIDstoNumeric(labels, "edge_label");
+                labels = mappedLabels._1;
+                mappedLabels._2.withColumn(
+                        "edge_label_reindexed", col("tgt_edge_label").plus(functions.lit(1))
+                ).drop("tgt_edge_label").withColumnRenamed("edge_label_reindexed", "tgt_edge_label").write().parquet(raw + "/label_id_to_vector_index");
+            } else {
+                Dataset<Row> labelMappings = spark.read().parquet(raw + "/label_id_to_vector_index");
+                Dataset<Row> finalLabels = labels;
+                // Reapply labelMappings to labels
+                labels = labels.join(
+                        labelMappings,
+                        labels.col("edge_label").equalTo(labelMappings.col("src_edge_label"))
+                ).drop(
+                        labels.col("edge_label"), labelMappings.col("src_edge_label")
+                ).select(
+                        Arrays.stream(labels.columns()).map(
+                                col -> col.equalsIgnoreCase("edge_label") ? labelMappings.col("tgt_edge_label").as("edge_label") : finalLabels.col(col)
+                        ).toArray(Column[]::new)
+                );
+            }
+            labels = labels.join(
+                    mappings.alias("mappings_src"),
+                    labels.col("src_node_id").equalTo(mappings.col("mappings_src.src_node_id")),
+                    "inner"
+            ).join(
+                    mappings.alias("mappings_tgt"),
+                    labels.col("tgt_node_id_").equalTo(mappings.col("mappings_tgt.src_node_id"))
+            ).select(
+                    col("mappings_src.tgt_node_id").alias("src_node_id"),
+                    col("mappings_tgt.tgt_node_id").alias("tgt_node_id"),
+                    labels.col("edge_label").plus(functions.lit(1)).alias("edge_label")
+            );
+            labels.write().parquet(raw + "/labels");
+        }
         labels = spark.read().parquet(raw + "/labels");
+
         String datasets = persistence + "/featurized_datasets/" + tag;
         Dataset<Row> pairs = spark.read().parquet(raw + "/scored_node_pairs").select("x_node_id", "y_node_id").distinct();
         // Construct similarity score metrics for node description embeddings
@@ -214,7 +264,6 @@ public class EdgeMiner {
                 pcaSimScoring.col("sim_score"),
                 heuristicFeatureVectors.col("heuristics_vector")
         ).write().parquet(datasets + "/full_dataset_vectors");
-
     }
 
     private static void processEmbeddingBatch(
