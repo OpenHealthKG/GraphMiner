@@ -111,7 +111,7 @@ public class EdgeMiner {
             ).select(
                     col("mappings_src.tgt_node_id").alias("src_node_id"),
                     col("mappings_tgt.tgt_node_id").alias("tgt_node_id"),
-                    labels.col("edge_label").plus(functions.lit(1)).alias("edge_label")
+                    labels.col("edge_label")
             );
             labels.write().parquet(raw + "/labels");
         }
