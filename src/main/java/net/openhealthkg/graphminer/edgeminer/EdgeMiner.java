@@ -1,5 +1,6 @@
 package net.openhealthkg.graphminer.edgeminer;
 
+import static org.apache.spark.ml.functions.vector_to_array;
 import static org.apache.spark.sql.functions.*;
 
 import com.azure.ai.openai.OpenAIClient;
@@ -179,10 +180,37 @@ public class EdgeMiner {
         );
         distances.write().mode("overwrite").parquet(raw + "/vector_distances");
         distances = spark.read().parquet(raw + "/vector_distances");
+        Dataset<Row> nodeMetadata = spark.read().parquet(raw + "/node_metadata");
+        Dataset<Row> edgeTypeMappings;
+        if (!new java.io.File(raw + "/edge_type_mappings").exists()) {
+            edgeTypeMappings = Util.mapIDstoNumeric(nodeMetadata, "node_type");
+            edgeTypeMappings.write().parquet(raw + "/edge_type_mappings");
+        }
+        edgeTypeMappings = spark.read().parquet(raw + "/edge_type_mappings");
+        nodeMetadata = Util.applyMapping(nodeMetadata, edgeTypeMappings, "node_type");
+        nodeMetadata = Util.applyMapping(nodeMetadata, mappings, "node_id");
+        nodeNameVectors = Util.applyMapping(nodeNameVectors, mappings, "node_id");
         // Create feature vectors for x, y pairs and write
-        df = pairs.join(distances, pairs.col("x_node_id").equalTo(distances.col("x_node_id")).and(pairs.col("y_node_id").equalTo(distances.col("y_node_id")))).select(
+        df = pairs.join(
+                nodeMetadata.alias("x_node_metadata"),
+                pairs.col("x_node_id").equalTo(col("x_node_metadata.node_id"))
+        ).select(
                 pairs.col("x_node_id"),
                 pairs.col("y_node_id"),
+                col("x_node_metadata.node_type").alias("x_node_type")
+        ).join(
+                nodeMetadata.alias("y_node_metadata"),
+                pairs.col("y_node_id").equalTo(col("y_node_metadata.node_id"))
+        ).select(
+                pairs.col("x_node_id"),
+                pairs.col("y_node_id"),
+                col("x_node_type"),
+                col("y_node_metadata.node_type").alias("y_node_type")
+        ).join(distances, pairs.col("x_node_id").equalTo(distances.col("x_node_id")).and(pairs.col("y_node_id").equalTo(distances.col("y_node_id")))).select(
+                pairs.col("x_node_id"),
+                pairs.col("y_node_id"),
+                col("x_node_type"),
+                col("y_node_type"),
                 distances.col("cos_sim"),
                 distances.col("euclidean_distance"),
                 distances.col("dot_product"),
@@ -193,11 +221,19 @@ public class EdgeMiner {
         ).select(
                 pairs.col("x_node_id"),
                 pairs.col("y_node_id"),
+                col("x_node_type"),
+                col("y_node_type"),
                 distances.col("cos_sim"),
                 distances.col("euclidean_distance"),
                 distances.col("dot_product"),
                 distances.col("manhattan_distance"),
                 pcaSimScoring.col("sim_score")
+        ).join(
+                nodeNameVectors.alias("x_emb"),
+                pairs.col("x_node_id").equalTo(col("x_emb.node_id"))
+        ).join(
+                nodeNameVectors.alias("y_emb"),
+                pairs.col("y_node_id").equalTo(col("y_emb.node_id"))
         ).join(
                 labels,
                 pairs.col("x_node_id").equalTo(labels.col("src_node_id")).and(pairs.col("y_node_id").equalTo(labels.col("tgt_node_id"))),
@@ -205,11 +241,15 @@ public class EdgeMiner {
         ).select(
                 pairs.col("x_node_id"),
                 pairs.col("y_node_id"),
+                col("x_node_type"),
+                col("y_node_type"),
                 distances.col("cos_sim"),
                 distances.col("euclidean_distance"),
                 distances.col("dot_product"),
                 distances.col("manhattan_distance"),
                 pcaSimScoring.col("sim_score"),
+                col("x_emb.node_embeddings").alias("x_node_embeddings"),
+                col("y_emb.node_embeddings").alias("y_node_embeddings"),
                 functions.coalesce(labels.col("edge_label"), lit(0)).alias("edge_label")
         );
         df.join(
@@ -222,11 +262,15 @@ public class EdgeMiner {
                 lit(tag).alias("tag"),
                 col("mappings_x.src_node_id").alias("x_node_id"),
                 col("mappings_y.src_node_id").alias("y_node_id"),
+                col("x_node_type"),
+                col("y_node_type"),
                 distances.col("cos_sim"),
                 distances.col("euclidean_distance"),
                 distances.col("dot_product"),
                 distances.col("manhattan_distance"),
                 pcaSimScoring.col("sim_score"),
+                col("x_node_embeddings"),
+                col("y_node_embeddings"),
                 col("edge_label")
         ).write().parquet(datasets + "/full_dataset_vectors");
     }
@@ -244,7 +288,7 @@ public class EdgeMiner {
         for (EmbeddingItem item : embeddings.getData()) {
             String nodeId = nodeIds.get(i++);
             double[] vector = item.getEmbedding().stream().mapToDouble(Float::doubleValue).toArray();
-            out.add(RowFactory.create(nodeId, Vectors.dense(vector)));
+            out.add(RowFactory.create(nodeId, Vectors.dense(vector).toArray()));
         }
     }
 
@@ -252,7 +296,7 @@ public class EdgeMiner {
         int BATCH_SIZE = 256;
         StructType schema = new StructType()
                 .add("node_id", DataTypes.StringType, false)
-                .add("node_embeddings", new VectorUDT(), false);
+                .add("node_embeddings", DataTypes.createArrayType(DataTypes.DoubleType), false);
 
         return df.mapPartitions((MapPartitionsFunction<Row, Row>) it -> {
             OpenAIClient client = new OpenAIClientBuilder()
