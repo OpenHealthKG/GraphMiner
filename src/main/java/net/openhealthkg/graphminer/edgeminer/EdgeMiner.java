@@ -59,23 +59,15 @@ public class EdgeMiner {
         Dataset<Row> mappings;
         if (!new java.io.File(raw + "/source_node_id_to_vector_index").exists()) {
             df = df.select("node_id", "occurrence_id").distinct();
-            Tuple2<Dataset<Row>, Dataset<Row>> mapped = Util.mapIDstoNumeric(df, "node_id");
-            df = mapped._1;
-            mappings = mapped._2;
+            mappings = Util.mapIDstoNumeric(df, "node_id");
             mappings.write().parquet(raw + "/source_node_id_to_vector_index");
-            mappings = spark.read().parquet(raw + "/source_node_id_to_vector_index");
-        } else {
-            mappings = spark.read().parquet(raw + "/source_node_id_to_vector_index");
-            // reapply mappings to df
-            df = df.join(mappings, df.col("node_id").equalTo(mappings.col("src_node_id"))
-            ).drop(df.col("node_id")).drop(mappings.col("src_node_id")).select(
-                    mappings.col("tgt_node_id").alias("node_id"),
-                    df.col("occurrence_id")
-            );
+
         }
+        mappings = spark.read().parquet(raw + "/source_node_id_to_vector_index");
+        df = Util.applyMapping(df, mappings, "node_id");
 
         long numNodes = mappings.count();
-        df = Util.mapIDstoNumeric(df, "occurrence_id")._1; // We don't need to retain the original occurrence_id
+        df = Util.applyMapping(df, Util.mapIDstoNumeric(df, "occurrence_id"), "occurrence_id"); // We don't need to retain the original occurrence_id
         // Perform the actual scoring.
         Dataset<Row> scoreTermPairs;
         if (!new java.io.File(raw + "/scored_node_pairs").exists()) {
@@ -103,26 +95,12 @@ public class EdgeMiner {
 
         if (!new java.io.File(raw + "/labels").exists()) {
             if (!new java.io.File(raw + "/label_id_to_vector_index").exists()) {
-                Tuple2<Dataset<Row>, Dataset<Row>> mappedLabels = Util.mapIDstoNumeric(labels, "edge_label");
-                labels = mappedLabels._1;
-                mappedLabels._2.withColumn(
-                        "edge_label_reindexed", col("tgt_edge_label").plus(functions.lit(1))
-                ).drop("tgt_edge_label").withColumnRenamed("edge_label_reindexed", "tgt_edge_label").write().parquet(raw + "/label_id_to_vector_index");
-            } else {
-                Dataset<Row> labelMappings = spark.read().parquet(raw + "/label_id_to_vector_index");
-                Dataset<Row> finalLabels = labels;
-                // Reapply labelMappings to labels
-                labels = labels.join(
-                        labelMappings,
-                        labels.col("edge_label").equalTo(labelMappings.col("src_edge_label"))
-                ).drop(
-                        labels.col("edge_label"), labelMappings.col("src_edge_label")
-                ).select(
-                        Arrays.stream(labels.columns()).map(
-                                col -> col.equalsIgnoreCase("edge_label") ? labelMappings.col("tgt_edge_label").as("edge_label") : finalLabels.col(col)
-                        ).toArray(Column[]::new)
-                );
+                Dataset<Row> labelMappings = Util.mapIDstoNumeric(labels, "edge_label").select(col("src_edge_label"), col("tgt_edge_label").plus(1).alias("tgt_edge_label"));
+                labelMappings.write().parquet(raw + "/label_id_to_vector_index");
             }
+            Dataset<Row> labelMappings = spark.read().parquet(raw + "/label_id_to_vector_index");
+            // Reapply labelMappings to labels
+            labels = Util.applyMapping(labels, labelMappings, "edge_label");
             labels = labels.join(
                     mappings.alias("mappings_src"),
                     labels.col("src_node_id").equalTo(col("mappings_src.src_node_id")),

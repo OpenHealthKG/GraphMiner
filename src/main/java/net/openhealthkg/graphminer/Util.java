@@ -18,14 +18,18 @@ public class Util {
      * @param column
      * @return
      */
-    public static Tuple2<Dataset<Row> , Dataset<Row>> mapIDstoNumeric(Dataset<Row> input, String column) {
-        String[] columns = input.columns();
+    public static Dataset<Row> mapIDstoNumeric(Dataset<Row> input, String column) {
         Dataset<Row> mappingDF = input.select(column).distinct().withColumnRenamed(column, "src_" + column).withColumn("tgt_" + column, functions.row_number().over(Window.orderBy(functions.rand(123)))).persist(StorageLevel.DISK_ONLY()); // Persist the mapping DF for consistency
+        return mappingDF;
+    }
+
+    public static Dataset<Row> applyMapping(Dataset<Row> input, Dataset<Row> mappingDF, String column) {
+        String[] columns = input.columns();
         Dataset<Row> outputDF = input.join(
                 mappingDF, input.col(column).equalTo(mappingDF.col("src_" + column))
         ).select(
                 Arrays.stream(columns).map(s -> s.equals(column) ? functions.col("tgt_" + column).alias(column) : functions.col(s)).toArray(Column[]::new)
         );
-        return new Tuple2<>(outputDF, mappingDF);
+        return outputDF;
     }
 }
