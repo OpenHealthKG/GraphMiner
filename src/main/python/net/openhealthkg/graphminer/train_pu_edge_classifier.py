@@ -20,18 +20,23 @@ Y_TYPE_COL = "y_node_type"
 
 @dataclass
 class TrainConfig:
-    parquet_glob: str
-    num_edge_types: int
+    # Pre-split inputs
+    train_glob: str
+    val_glob: str
+    test_glob: str
+
+    # Allow auto-infer from data if omitted
+    num_edge_types: Optional[int] = None
 
     # PU knobs
-    unlabeled_keep_prob: float = 0.2  # downsample label==0
-    unlabeled_weight: float = 0.1  # BCE weight for unlabeled rows
-    type_loss_weight: float = 0.5  # lambda for multiclass head
+    unlabeled_keep_prob: float = 0.2
+    unlabeled_weight: float = 0.1
+    type_loss_weight: float = 0.5
 
     # Training knobs
     batch_size: int = 2048
     num_workers: int = 2
-    epochs: int = 3
+    epochs: int = 20
     lr: float = 2e-4
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
@@ -41,6 +46,12 @@ class TrainConfig:
     type_emb_dim: int = 16
     hidden: int = 256
     dropout: float = 0.1
+
+    # Early stopping
+    early_stop: bool = True
+    patience: int = 3
+    min_delta: float = 1e-4
+    val_max_batches: int = 200
 
 class EdgeParquetIterable(torch.utils.data.IterableDataset):
     """
@@ -117,13 +128,59 @@ def collate(batch):
     Xs, xemb, yemb, xt, yt, y = zip(*batch)
     return (
         torch.tensor(np.stack(Xs), dtype=torch.float32),
-        torch.tensor(np.stack(xemb), dtype=torch.zfloat32),
+        torch.tensor(np.stack(xemb), dtype=torch.float32),
         torch.tensor(np.stack(yemb), dtype=torch.float32),
         torch.tensor(xt, dtype=torch.long),
         torch.tensor(yt, dtype=torch.long),
         torch.tensor(y, dtype=torch.long),
     )
 
+def infer_num_edge_types(files):
+    max_label = 0
+    for path in files:
+        pf = pq.ParquetFile(path)
+        for rg in range(pf.num_row_groups):
+            y = np.asarray(
+                pf.read_row_group(rg, columns=[LABEL_COL]).to_pydict()[LABEL_COL],
+                dtype=np.int64
+            )
+            if y.size:
+                ml = int(y.max())
+                if ml > max_label:
+                    max_label = ml
+    return max_label
+
+def evaluate(model, dl, device, cfg: TrainConfig):
+    model.eval()
+    losses, bces, ces = [], [], []
+
+    for i, (scalars, xemb, yemb, xt, yt, y) in enumerate(dl):
+        scalars = scalars.to(device, non_blocking=True)
+        xemb = xemb.to(device, non_blocking=True)
+        yemb = yemb.to(device, non_blocking=True)
+        xt = xt.to(device, non_blocking=True)
+        yt = yt.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        edge_logit, type_logits, _ = model(scalars, xemb, yemb, xt, yt)
+        loss, bce, ce = pu_typed_loss(
+            edge_logit, type_logits, y,
+            unlabeled_weight=cfg.unlabeled_weight,
+            type_loss_weight=cfg.type_loss_weight,
+            class_weights=None
+        )
+        losses.append(float(loss.item()))
+        bces.append(float(bce.item()))
+        ces.append(float(ce.item()))
+
+        if cfg.val_max_batches and (i + 1) >= cfg.val_max_batches:
+            break
+
+    return {
+        "loss": float(np.mean(losses)) if losses else float("inf"),
+        "bce": float(np.mean(bces)) if bces else float("inf"),
+        "ce": float(np.mean(ces)) if ces else float("inf"),
+    }
 
 class TypedPUEdgeModel(nn.Module):
     # Use a three-tower approach to prevent early cross-contamination of features (particularly due to large
@@ -243,23 +300,44 @@ def cleanup_ddp():
         torch.distributed.destroy_process_group()
 
 def train(cfg: TrainConfig):
-    files = sorted(glob.glob(cfg.parquet_glob))
-    assert files, f"No parquet matched: {cfg.parquet_glob}"
+    train_files = sorted(glob.glob(cfg.train_glob))
+    val_files   = sorted(glob.glob(cfg.val_glob))
+    test_files  = sorted(glob.glob(cfg.test_glob))
+    assert train_files, f"No parquet matched train_glob: {cfg.train_glob}"
+    assert val_files,   f"No parquet matched val_glob:   {cfg.val_glob}"
+    assert test_files,  f"No parquet matched test_glob:  {cfg.test_glob}"
+
+    # infer K if needed (scan train+val; test is optional)
+    if cfg.num_edge_types is None:
+        if int(os.environ.get("RANK", "0")) == 0:
+            print("Inferring num_edge_types from labels in train+val...")
+        cfg.num_edge_types = infer_num_edge_types(train_files + val_files)
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(f"Inferred num_edge_types={cfg.num_edge_types}")
 
     ddp, local_rank = setup_ddp()
     device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
 
-    pf0 = pq.ParquetFile(files[0])
+    # infer embedding dim from first train file
+    pf0 = pq.ParquetFile(train_files[0])
     sample = pf0.read_row_group(0, columns=[X_EMB_COL]).to_pydict()[X_EMB_COL][0]
     emb_dim = len(sample)
 
-    ds = EdgeParquetIterable(files, cfg, shuffle_files=True)
-    dl = torch.utils.data.DataLoader(
-        ds,
-        batch_size=cfg.batch_size,
-        num_workers=cfg.num_workers,
-        pin_memory=True,
-        collate_fn=collate,
+    train_ds = EdgeParquetIterable(train_files, cfg, shuffle_files=True)
+    val_ds   = EdgeParquetIterable(val_files,   cfg, shuffle_files=False)
+    test_ds  = EdgeParquetIterable(test_files,  cfg, shuffle_files=False)
+
+    train_dl = torch.utils.data.DataLoader(
+        train_ds, batch_size=cfg.batch_size, num_workers=cfg.num_workers,
+        pin_memory=True, collate_fn=collate
+    )
+    val_dl = torch.utils.data.DataLoader(
+        val_ds, batch_size=cfg.batch_size, num_workers=cfg.num_workers,
+        pin_memory=True, collate_fn=collate
+    )
+    test_dl = torch.utils.data.DataLoader(
+        test_ds, batch_size=cfg.batch_size, num_workers=cfg.num_workers,
+        pin_memory=True, collate_fn=collate
     )
 
     model = TypedPUEdgeModel(emb_dim=emb_dim, num_types=cfg.num_edge_types, cfg=cfg, max_type_id=600).to(device)
@@ -269,11 +347,13 @@ def train(cfg: TrainConfig):
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
-    class_weights = None
+    best_val = float("inf")
+    best_state = None
+    bad_epochs = 0
 
     for epoch in range(cfg.epochs):
         model.train()
-        for step, (scalars, xemb, yemb, xt, yt, y) in enumerate(dl):
+        for step, (scalars, xemb, yemb, xt, yt, y) in enumerate(train_dl):
             scalars = scalars.to(device, non_blocking=True)
             xemb = xemb.to(device, non_blocking=True)
             yemb = yemb.to(device, non_blocking=True)
@@ -288,7 +368,7 @@ def train(cfg: TrainConfig):
                     edge_logit, type_logits, y,
                     unlabeled_weight=cfg.unlabeled_weight,
                     type_loss_weight=cfg.type_loss_weight,
-                    class_weights=class_weights
+                    class_weights=None
                 )
 
             scaler.scale(loss).backward()
@@ -305,13 +385,41 @@ def train(cfg: TrainConfig):
                     f"gate=[scalar={gmean[0]:.2f}, emb={gmean[1]:.2f}, type={gmean[2]:.2f}]"
                 )
 
+        # ---- validate + early stop on rank 0 ----
+        if int(os.environ.get("RANK", "0")) == 0:
+            metrics = evaluate(model, val_dl, device, cfg)
+            print(f"[val] epoch={epoch} loss={metrics['loss']:.4f} bce={metrics['bce']:.4f} ce={metrics['ce']:.4f}")
+
+            improved = (best_val - metrics["loss"]) > cfg.min_delta
+            if improved:
+                best_val = metrics["loss"]
+                bad_epochs = 0
+                m = model.module if hasattr(model, "module") else model
+                best_state = {k: v.detach().cpu().clone() for k, v in m.state_dict().items()}
+            else:
+                bad_epochs += 1
+                if cfg.early_stop and bad_epochs >= cfg.patience:
+                    print(f"Early stopping at epoch={epoch} (best_val={best_val:.4f})")
+                    break
+
+    # restore best before test
+    if best_state is not None:
+        m = model.module if hasattr(model, "module") else model
+        m.load_state_dict(best_state)
+
+    if int(os.environ.get("RANK", "0")) == 0:
+        t = evaluate(model, test_dl, device, cfg)
+        print(f"[test] loss={t['loss']:.4f} bce={t['bce']:.4f} ce={t['ce']:.4f}")
+
     cleanup_ddp()
     return model
 
 
 if __name__ == "__main__":
     cfg = TrainConfig(
-        parquet_glob="/path/to/full_dataset_vectors/*.parquet",
+        train_glob="/path/to/train_dataset_vectors/*.parquet",
+        test_glob="/path/to/test_dataset_vectors/*.parquet",
+        val_glob="/path/to/val_dataset_vectors/*.parquet",
         num_edge_types=5,
         unlabeled_keep_prob=0.2,
         unlabeled_weight=0.1,
