@@ -20,10 +20,12 @@ Y_TYPE_COL = "y_node_type"
 
 @dataclass
 class TrainConfig:
-    # Pre-split inputs
-    train_glob: str
-    val_glob: str
-    test_glob: str
+    # Partitioned input root: expects /partitions/{idx}/*.parquet
+    partitions_root: str
+
+    # CV setup
+    cv_partitions: List[int] = None          # defaults to [0,1,2,3,4]
+    holdout_partition: int = 5               # final test fold
 
     # Allow auto-infer from data if omitted
     num_edge_types: Optional[int] = None
@@ -52,6 +54,41 @@ class TrainConfig:
     patience: int = 3
     min_delta: float = 1e-4
     val_max_batches: int = 200
+
+    def __post_init__(self):
+        if self.cv_partitions is None:
+            self.cv_partitions = [0, 1, 2, 3, 4]
+
+def get_partition_files(partitions_root: str, partition_idx: int) -> List[str]:
+    part_glob = os.path.join(partitions_root, str(partition_idx), "*.parquet")
+    files = sorted(glob.glob(part_glob))
+    if not files:
+        raise AssertionError(f"No parquet matched partition glob: {part_glob}")
+    return files
+
+
+def get_files_for_partitions(partitions_root: str, partition_indices: List[int]) -> List[str]:
+    files = []
+    for idx in partition_indices:
+        files.extend(get_partition_files(partitions_root, idx))
+    if not files:
+        raise AssertionError(f"No parquet found for partitions: {partition_indices}")
+    return sorted(files)
+
+
+def build_fold_file_sets(cfg: TrainConfig, val_partition: int):
+    train_partitions = [p for p in cfg.cv_partitions if p != val_partition]
+    val_partitions = [val_partition]
+
+    train_files = get_files_for_partitions(cfg.partitions_root, train_partitions)
+    val_files = get_files_for_partitions(cfg.partitions_root, val_partitions)
+    return train_files, val_files
+
+
+def build_final_train_and_test_sets(cfg: TrainConfig):
+    train_files = get_files_for_partitions(cfg.partitions_root, cfg.cv_partitions)
+    test_files = get_files_for_partitions(cfg.partitions_root, [cfg.holdout_partition])
+    return train_files, test_files
 
 class EdgeParquetIterable(torch.utils.data.IterableDataset):
     """
