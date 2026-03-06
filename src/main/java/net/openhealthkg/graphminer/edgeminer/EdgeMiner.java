@@ -1,6 +1,5 @@
 package net.openhealthkg.graphminer.edgeminer;
 
-import static org.apache.spark.ml.functions.vector_to_array;
 import static org.apache.spark.sql.functions.*;
 
 import com.azure.ai.openai.OpenAIClient;
@@ -28,14 +27,11 @@ import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.Metadata;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
-import scala.Tuple2;
 
 import com.azure.ai.openai.models.Embeddings;
 import com.azure.ai.openai.models.EmbeddingsOptions;
 
 import java.util.*;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collectors;
 
 public class EdgeMiner {
     public void generateEdgeFeatures(SparkSession spark, String persistence, String tag, Dataset<Row> df, Dataset<Row> labels, long cohortSize, int keepTopN, PXYHeuristic... heuristics) {
@@ -271,8 +267,12 @@ public class EdgeMiner {
                 pcaSimScoring.col("sim_score"),
                 col("x_node_embeddings"),
                 col("y_node_embeddings"),
-                col("edge_label")
+                col("edge_label"),
+                floor(rand().multiply(functions.lit(6))).cast(DataTypes.IntegerType).alias("rand") // Five-fold cross-val + one additional test set
         ).write().parquet(datasets + "/full_dataset_vectors");
+        for (int i = 0; i < 6; i++) {
+            spark.read().parquet(datasets + "/full_dataset_vectors").filter(col("rand").equalTo(i)).write().parquet(datasets + "/partitions/" + i);
+        }
     }
 
     private static void processEmbeddingBatch(
@@ -506,7 +506,7 @@ public class EdgeMiner {
                         new StructType(
                                 new StructField[]{
                                         StructField.apply("x_node_id", DataTypes.IntegerType, false, Metadata.empty()),
-                                        StructField.apply("heuristics_vector", new VectorUDT(), false, Metadata.empty())
+                                        StructField.apply("heuristics_vector", DataTypes.createArrayType(DataTypes.DoubleType), false, Metadata.empty())
                                 }
                         )
                 )
