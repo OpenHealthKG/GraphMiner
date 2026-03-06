@@ -271,7 +271,7 @@ public class EdgeMiner {
                 floor(rand().multiply(functions.lit(6))).cast(DataTypes.IntegerType).alias("rand") // Five-fold cross-val + one additional test set
         ).write().parquet(datasets + "/full_dataset_vectors");
         for (int i = 0; i < 6; i++) {
-            spark.read().parquet(datasets + "/full_dataset_vectors").filter(col("rand").equalTo(i)).write().parquet(datasets + "/partitions/" + i);
+            spark.read().parquet(datasets + "/full_dataset_vectors").drop("rand").filter(col("rand").equalTo(i)).write().parquet(datasets + "/partitions/" + i);
         }
     }
 
@@ -500,7 +500,7 @@ public class EdgeMiner {
                         indices.add(k);
                         values.add(valueMap.get(k));
                     });
-                    return RowFactory.create(xid, new SparseVector(Math.toIntExact(numNodes * heuristics.length), indices.stream().mapToInt(Integer::intValue).toArray(), values.stream().mapToDouble(Double::doubleValue).toArray()));
+                    return RowFactory.create(xid, new SparseVector(Math.toIntExact(numNodes * heuristics.length), indices.stream().mapToInt(Integer::intValue).toArray(), values.stream().mapToDouble(Double::doubleValue).toArray()).toArray());
                 },
                 RowEncoder.encoderFor(
                         new StructType(
