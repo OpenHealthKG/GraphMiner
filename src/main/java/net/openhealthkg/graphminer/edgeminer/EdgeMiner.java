@@ -22,6 +22,7 @@ import org.apache.spark.sql.*;
 import org.apache.spark.sql.api.java.UDF1;
 import org.apache.spark.sql.api.java.UDF2;
 import org.apache.spark.sql.catalyst.encoders.RowEncoder;
+import org.apache.spark.sql.expressions.UserDefinedFunction;
 import org.apache.spark.sql.expressions.Window;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.Metadata;
@@ -131,7 +132,12 @@ public class EdgeMiner {
                         col("y_embeddings.node_embeddings").alias("y_node_embedding")
                 );
         // - Now calculate vector distance
-        Dataset<Row> distances = pairsWithEmbeddings.select(
+        UserDefinedFunction toVector = udf((UDF1<Double[], Vector>) a1 -> Vectors.dense(Arrays.stream(a1).mapToDouble(Double::doubleValue).toArray()), new VectorUDT());
+        Dataset<Row> distances = pairsWithEmbeddings.withColumn(
+                "x_node_embedding_vec", toVector.apply(col("x_node_embedding"))
+        ).withColumn(
+                "y_node_embedding_vec", toVector.apply(col("y_node_embedding"))
+        ).select(
                 col("x_node_id"),
                 col("y_node_id"),
                 // Cosine similarity
@@ -141,7 +147,7 @@ public class EdgeMiner {
                     double denom = Vectors.norm(v1, 2.0) * Vectors.norm(v2, 2.0);
                     if (denom == 0.0) return null; // undefined if either vector is zero
                     return BLAS.dot(v1, v2) / denom;
-                }, DataTypes.DoubleType).apply(col("x_node_embedding"), col("y_node_embedding")).as("cos_sim"),
+                }, DataTypes.DoubleType).apply(col("x_node_embedding_vec"), col("y_node_embedding_vec")).as("cos_sim"),
                 // Euclidean distance
                 functions.udf(
                         (UDF2<Vector, Vector, Double>) (v1, v2) -> {
@@ -158,9 +164,9 @@ public class EdgeMiner {
                             }
                             return Math.sqrt(sumSq);
                         }, DataTypes.DoubleType
-                ).apply(col("x_node_embedding"), col("y_node_embedding")).as("euclidean_distance"),
+                ).apply(col("x_node_embedding_vec"), col("y_node_embedding_vec")).as("euclidean_distance"),
                 // Dot product
-                functions.udf((UDF2<Vector, Vector, Double>) BLAS::dot, DataTypes.DoubleType).apply(col("x_node_embedding"), col("y_node_embedding")).as("dot_product"),
+                functions.udf((UDF2<Vector, Vector, Double>) BLAS::dot, DataTypes.DoubleType).apply(col("x_node_embedding_vec"), col("y_node_embedding_vec")).as("dot_product"),
                 // Manhattan distance
                 functions.udf((UDF2<Vector, Vector, Double>) (v1, v2) -> {
                     if (v1 == null || v2 == null) return null;
@@ -172,7 +178,7 @@ public class EdgeMiner {
                     double sum = 0.0;
                     for (int i = 0; i < aa.length; i++) sum += Math.abs(aa[i] - bb[i]);
                     return sum;
-                }, DataTypes.DoubleType).apply(col("x_node_embedding"), col("y_node_embedding")).as("manhattan_distance")
+                }, DataTypes.DoubleType).apply(col("x_node_embedding_vec"), col("y_node_embedding_vec")).as("manhattan_distance")
         );
         distances.write().mode("overwrite").parquet(raw + "/vector_distances");
         distances = spark.read().parquet(raw + "/vector_distances");
