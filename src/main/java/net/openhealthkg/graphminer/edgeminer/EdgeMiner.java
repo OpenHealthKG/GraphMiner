@@ -132,7 +132,7 @@ public class EdgeMiner {
                         col("y_embeddings.node_embeddings").alias("y_node_embedding")
                 );
         // - Now calculate vector distance
-        UserDefinedFunction toVector = udf((UDF1<Double[], Vector>) a1 -> Vectors.dense(Arrays.stream(a1).mapToDouble(Double::doubleValue).toArray()), new VectorUDT());
+        UserDefinedFunction toVector = udf((UDF1<List<Double>, Vector>) a1 -> Vectors.dense(a1.stream().mapToDouble(Double::doubleValue).toArray()), new VectorUDT());
         Dataset<Row> distances = pairsWithEmbeddings.withColumn(
                 "x_node_embedding_vec", toVector.apply(col("x_node_embedding"))
         ).withColumn(
