@@ -31,7 +31,7 @@ import org.apache.spark.sql.types.StructType;
 
 import com.azure.ai.openai.models.Embeddings;
 import com.azure.ai.openai.models.EmbeddingsOptions;
-import scala.collection.mutable.ArraySeq;
+import scala.collection.immutable.ArraySeq;
 import scala.jdk.CollectionConverters;
 
 import java.util.*;
