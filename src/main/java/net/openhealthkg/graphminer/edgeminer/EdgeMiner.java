@@ -31,6 +31,8 @@ import org.apache.spark.sql.types.StructType;
 
 import com.azure.ai.openai.models.Embeddings;
 import com.azure.ai.openai.models.EmbeddingsOptions;
+import scala.collection.mutable.ArraySeq;
+import scala.jdk.CollectionConverters;
 
 import java.util.*;
 
@@ -132,7 +134,15 @@ public class EdgeMiner {
                         col("y_embeddings.node_embeddings").alias("y_node_embedding")
                 );
         // - Now calculate vector distance
-        UserDefinedFunction toVector = udf((UDF1<Double[], Vector>) a1 -> Vectors.dense(Arrays.stream(a1).mapToDouble(Double::doubleValue).toArray()), new VectorUDT());
+        UserDefinedFunction toVector = udf((UDF1<ArraySeq<Double>, Vector>) seq -> {
+            int n = seq.size();
+            double[] values = new double[n];
+
+            for (int i = 0; i < n; i++) {
+                values[i] = seq.apply(i);
+            }
+            return Vectors.dense(values);
+        }, new VectorUDT());
         Dataset<Row> distances = pairsWithEmbeddings.withColumn(
                 "x_node_embedding_vec", toVector.apply(col("x_node_embedding"))
         ).withColumn(
