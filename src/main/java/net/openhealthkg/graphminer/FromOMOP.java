@@ -50,9 +50,24 @@ public class FromOMOP {
                         col("person_id").cast("string").alias("occurrence_id")
                 )
                 .where(col("node_id").isNotNull().and(col("node_id").notEqual("0")));
+        // device_exposure: (person_id, device_concept_id)
+        Dataset<Row> device = spark.table("device_exposure")
+                .select(
+                        col("device_concept_id").cast("string").alias("node_id"),
+                        col("person_id").cast("string").alias("occurrence_id")
+                )
+                .where(col("node_id").isNotNull().and(col("node_id").notEqual("0")));
+
+        // measurement: (person_id, measurement_concept_id)
+        Dataset<Row> measurement = spark.table("measurement")
+                .select(
+                        col("measurement_concept_id").cast("string").alias("node_id"),
+                        col("person_id").cast("string").alias("occurrence_id")
+                )
+                .where(col("node_id").isNotNull().and(col("node_id").notEqual("0")));
 
         // Union into node_id, occurrence_id format
-        Dataset<Row> nodeOccurrences = cond.unionByName(drug).unionByName(proc).distinct().withColumn("tag", lit(tag));
+        Dataset<Row> nodeOccurrences = cond.unionByName(drug).unionByName(proc).unionByName(device).unionByName(measurement).distinct().withColumn("tag", lit(tag)).filter(col("node_id").isNotNull().and(col("node_id").notEqual("0")));
 
         // Load concept relationships
         Dataset<Row> relationships = spark.table("concept_relationship")
